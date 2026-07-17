@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Environments and editors
+.venv/
+.env
+.env.*
+.DS_Store
+.idea/
+.vscode/
+.ipynb_checkpoints/
+.kaggle/
+kaggle.json
+access_token
+
+# Local experiment outputs
+artifacts/
+logs/
+results/
+runs/
+wandb/
+
+# Model binaries belong in Drive/Releases, not normal Git history.
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.safetensors
+
+# Native competition binaries and downloaded archives.
+*.so
+*.dylib
+*.dll
+*.zip
+
+# Competition files are restricted and/or reproducible downloads.
+data/raw/
+data/official/
+data/processed/

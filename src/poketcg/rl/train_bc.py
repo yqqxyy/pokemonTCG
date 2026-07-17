@@ -1,0 +1,294 @@
+"""Train the initial candidate policy and value model from RuleAgent data."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import random
+from dataclasses import asdict, dataclass
+from pathlib import Path
+
+import torch
+from torch import nn
+from torch.utils.data import DataLoader, Sampler
+
+from .data import BCDataset, collate_bc
+from .model import PolicyValueModel, build_model, categorical_value_targets
+
+
+@dataclass(slots=True)
+class EpochMetrics:
+    epoch: int
+    train_loss: float
+    train_policy_accuracy: float
+    validation_loss: float
+    validation_policy_accuracy: float
+    validation_value_mae: float
+
+
+class TokenBucketBatchSampler(Sampler[list[int]]):
+    """Group similarly sized V2 token sequences to reduce attention padding."""
+
+    def __init__(
+        self,
+        dataset: BCDataset,
+        batch_size: int,
+        *,
+        shuffle: bool,
+        seed: int,
+    ) -> None:
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.seed = seed
+        self.epoch = 0
+
+    def __iter__(self):
+        generator = random.Random(self.seed + self.epoch)
+        indices = list(range(len(self.dataset)))
+        if self.shuffle:
+            generator.shuffle(indices)
+        indices.sort(key=lambda index: len(self.dataset[index].decision.tokens or []))
+        batches = [
+            indices[start : start + self.batch_size]
+            for start in range(0, len(indices), self.batch_size)
+        ]
+        if self.shuffle:
+            generator.shuffle(batches)
+        self.epoch += 1
+        yield from batches
+
+    def __len__(self) -> int:
+        return math.ceil(len(self.dataset) / self.batch_size)
+
+
+def resolve_device(name: str) -> torch.device:
+    if name != "auto":
+        return torch.device(name)
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
+def move_batch(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
+    return {key: value.to(device) for key, value in batch.items()}
+
+
+def batch_loss(
+    model: PolicyValueModel,
+    batch: dict[str, torch.Tensor],
+    value_coefficient: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    policy_logits, value_logits = model(batch)
+    policy_loss = -(
+        batch["policy_target"] * policy_logits.log_softmax(dim=-1)
+    ).sum(dim=-1).mean()
+    value_targets = categorical_value_targets(batch["value_target"], model.value_support)
+    value_loss = -(value_targets * value_logits.log_softmax(dim=-1)).sum(dim=-1).mean()
+    return policy_loss + value_coefficient * value_loss, policy_logits, value_logits
+
+
+def evaluate(
+    model: PolicyValueModel,
+    loader: DataLoader,
+    device: torch.device,
+    value_coefficient: float,
+) -> tuple[float, float, float]:
+    model.eval()
+    total_loss = 0.0
+    total_correct = 0
+    total_value_error = 0.0
+    total_examples = 0
+    with torch.no_grad():
+        for raw_batch in loader:
+            batch = move_batch(raw_batch, device)
+            loss, policy_logits, value_logits = batch_loss(model, batch, value_coefficient)
+            size = batch["action"].shape[0]
+            total_loss += float(loss) * size
+            prediction = policy_logits.argmax(dim=-1)
+            predicted_target = batch["policy_target"].gather(1, prediction.unsqueeze(1)).squeeze(1)
+            total_correct += int((predicted_target > 0).sum())
+            predicted_values = model.expected_value(value_logits)
+            total_value_error += float((predicted_values - batch["value_target"]).abs().sum())
+            total_examples += size
+    return (
+        total_loss / total_examples,
+        total_correct / total_examples,
+        total_value_error / total_examples,
+    )
+
+
+def split_by_game(dataset: BCDataset, validation_fraction: float, seed: int):
+    games = sorted({example.game for example in dataset.examples})
+    random.Random(seed).shuffle(games)
+    validation_count = max(1, round(len(games) * validation_fraction))
+    validation_games = set(games[:validation_count])
+    train = [example for example in dataset.examples if example.game not in validation_games]
+    validation = [example for example in dataset.examples if example.game in validation_games]
+    if not train or not validation:
+        raise ValueError("Dataset must contain enough games for a train/validation split.")
+    return BCDataset(train), BCDataset(validation)
+
+
+def train(args: argparse.Namespace) -> tuple[PolicyValueModel, list[EpochMetrics]]:
+    torch.manual_seed(args.seed)
+    dataset = BCDataset.from_jsonl(args.input)
+    data_versions = {example.decision.version for example in dataset.examples}
+    if len(data_versions) != 1:
+        raise ValueError("Training data cannot mix encoder versions")
+    data_version = data_versions.pop()
+    inferred_model_type = "transformer_v2" if data_version == 2 else "mlp_v1"
+    model_type = inferred_model_type if args.model_type == "auto" else args.model_type
+    if (model_type == "transformer_v2") != (data_version == 2):
+        raise ValueError(f"{model_type} is incompatible with encoder V{data_version} data")
+    train_data, validation_data = split_by_game(dataset, args.validation_fraction, args.seed)
+    if data_version == 2:
+        train_loader = DataLoader(
+            train_data,
+            batch_sampler=TokenBucketBatchSampler(
+                train_data, args.batch_size, shuffle=True, seed=args.seed
+            ),
+            collate_fn=collate_bc,
+        )
+        validation_loader = DataLoader(
+            validation_data,
+            batch_sampler=TokenBucketBatchSampler(
+                validation_data, args.batch_size, shuffle=False, seed=args.seed
+            ),
+            collate_fn=collate_bc,
+        )
+    else:
+        train_loader = DataLoader(
+            train_data,
+            batch_size=args.batch_size,
+            shuffle=True,
+            collate_fn=collate_bc,
+        )
+        validation_loader = DataLoader(
+            validation_data,
+            batch_size=args.batch_size,
+            shuffle=False,
+            collate_fn=collate_bc,
+        )
+    device = resolve_device(args.device)
+    model_config = {
+        "model_type": model_type,
+        "hidden_size": args.hidden_size,
+        "value_bins": args.value_bins,
+    }
+    if model_type == "transformer_v2":
+        model_config.update(
+            {
+                "num_layers": args.num_layers,
+                "num_heads": args.num_heads,
+                "dropout": args.dropout,
+                "card_vocab_size": args.card_vocab_size,
+                "attack_vocab_size": args.attack_vocab_size,
+            }
+        )
+    model = build_model(model_config).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-4)
+    history: list[EpochMetrics] = []
+    best_validation_loss = float("inf")
+    best_epoch = 0
+    best_state: dict[str, torch.Tensor] | None = None
+
+    for epoch in range(1, args.epochs + 1):
+        model.train()
+        total_loss = 0.0
+        total_correct = 0
+        total_examples = 0
+        for raw_batch in train_loader:
+            batch = move_batch(raw_batch, device)
+            optimizer.zero_grad(set_to_none=True)
+            loss, policy_logits, _ = batch_loss(model, batch, args.value_coefficient)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+            optimizer.step()
+            size = batch["action"].shape[0]
+            total_loss += float(loss.detach()) * size
+            prediction = policy_logits.argmax(dim=-1)
+            predicted_target = batch["policy_target"].gather(1, prediction.unsqueeze(1)).squeeze(1)
+            total_correct += int((predicted_target > 0).sum())
+            total_examples += size
+
+        validation_loss, validation_accuracy, validation_value_mae = evaluate(
+            model, validation_loader, device, args.value_coefficient
+        )
+        metrics = EpochMetrics(
+            epoch=epoch,
+            train_loss=round(total_loss / total_examples, 6),
+            train_policy_accuracy=round(total_correct / total_examples, 6),
+            validation_loss=round(validation_loss, 6),
+            validation_policy_accuracy=round(validation_accuracy, 6),
+            validation_value_mae=round(validation_value_mae, 6),
+        )
+        history.append(metrics)
+        print(json.dumps(asdict(metrics)))
+        if validation_loss < best_validation_loss:
+            best_validation_loss = validation_loss
+            best_epoch = epoch
+            best_state = {
+                key: value.detach().cpu().clone() for key, value in model.state_dict().items()
+            }
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    if best_state is None:
+        raise RuntimeError("Training finished without producing a checkpoint")
+    torch.save(
+        {
+            "model_state_dict": best_state,
+            "model_config": model_config,
+            "training_config": {
+                key: str(value) if isinstance(value, Path) else value
+                for key, value in vars(args).items()
+            },
+            "history": [asdict(item) for item in history],
+            "train_examples": len(train_data),
+            "validation_examples": len(validation_data),
+            "selected_epoch": best_epoch,
+            "selection_metric": "validation_loss",
+        },
+        args.output,
+    )
+    return model, history
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Train policy/value heads from RuleAgent data.")
+    parser.add_argument("--input", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--hidden-size", type=int, default=128)
+    parser.add_argument("--value-bins", type=int, default=101)
+    parser.add_argument(
+        "--model-type",
+        choices=("auto", "mlp_v1", "transformer_v2"),
+        default="auto",
+    )
+    parser.add_argument("--num-layers", type=int, default=3)
+    parser.add_argument("--num-heads", type=int, default=4)
+    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--card-vocab-size", type=int, default=2048)
+    parser.add_argument("--attack-vocab-size", type=int, default=2048)
+    parser.add_argument("--value-coefficient", type=float, default=0.25)
+    parser.add_argument("--max-grad-norm", type=float, default=0.5)
+    parser.add_argument("--validation-fraction", type=float, default=0.1)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", choices=("auto", "cpu", "mps", "cuda"), default="auto")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    train(args)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "poketcg-agent"
+version = "0.1.0"
+description = "Local agents and evaluation tools for the Pokemon TCG AI Battle Challenge"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=2.0",
+  "torch>=2.5",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.9",
+]
+
+[project.scripts]
+poketcg-evaluate = "poketcg.cli:main"
+poketcg-collect-bc = "poketcg.rl.collect_bc:main"
+poketcg-train-bc = "poketcg.rl.train_bc:main"
+poketcg-train-ppo = "poketcg.rl.train_ppo:main"
+poketcg-diagnose = "poketcg.rl.diagnose:main"
+poketcg-evaluate-panel = "poketcg.rl.evaluate_panel:main"
+
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+pythonpath = ["src"]
+testpaths = ["tests"]
+markers = [
+  "integration: tests that load the official native simulator",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = ["data/official", "data/raw", "data/processed"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
