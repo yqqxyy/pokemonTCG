@@ -40,6 +40,8 @@ class PPOTransition:
     action: int
     old_log_probability: float
     old_value: float
+    potential: float = 0.0
+    shaping_reward: float = 0.0
     advantage: float = 0.0
     value_target: float = 0.0
 
@@ -63,6 +65,8 @@ class IterationMetrics:
     rollout_seconds: float
     update_seconds: float
     games_per_second: float
+    mean_abs_shaping_reward: float
+    mean_shaping_return: float
     opponents: dict[str, dict[str, int | float]]
     sampling_weights: dict[str, float]
 
@@ -94,6 +98,8 @@ class _WorkerRolloutTask:
     seed: int
     gamma: float
     gae_lambda: float
+    reward_shaping: str
+    reward_shaping_scale: float
 
 
 @dataclass(slots=True)
@@ -141,23 +147,109 @@ def labeled_checkpoint_path(output: Path, label: str) -> Path:
 
 def compute_gae(
     values: list[float],
-    terminal_return: float,
+    terminal_return: float | None = None,
     *,
+    rewards: list[float] | None = None,
     gamma: float,
     gae_lambda: float,
 ) -> tuple[list[float], list[float]]:
     """Compute GAE over one player's decisions, excluding opponent and forced actions."""
+    if rewards is None:
+        if terminal_return is None:
+            raise ValueError("terminal_return is required when rewards are not provided")
+        rewards = [0.0] * len(values)
+        if rewards:
+            rewards[-1] = terminal_return
+    elif terminal_return is not None:
+        raise ValueError("provide either terminal_return or rewards, not both")
+    if len(rewards) != len(values):
+        raise ValueError("rewards and values must have the same length")
     advantages = [0.0] * len(values)
     next_value = 0.0
     next_advantage = 0.0
     for index in range(len(values) - 1, -1, -1):
-        reward = terminal_return if index == len(values) - 1 else 0.0
-        delta = reward + gamma * next_value - values[index]
+        delta = rewards[index] + gamma * next_value - values[index]
         next_advantage = delta + gamma * gae_lambda * next_advantage
         advantages[index] = next_advantage
         next_value = values[index]
     targets = [advantage + value for advantage, value in zip(advantages, values, strict=True)]
     return advantages, targets
+
+
+def prize_potential(observation: dict, learning_player: int) -> float:
+    """Return normalized relative prize progress from the learner's perspective."""
+    if learning_player not in {0, 1}:
+        raise ValueError("learning_player must be zero or one")
+    players = observation["current"]["players"]
+    own_remaining = len(players[learning_player].get("prize") or [])
+    opponent_remaining = len(players[1 - learning_player].get("prize") or [])
+    return (opponent_remaining - own_remaining) / 6.0
+
+
+def potential_shaping_rewards(
+    potentials: list[float],
+    *,
+    gamma: float,
+    scale: float,
+) -> list[float]:
+    """Redistribute reward with a terminal-zero potential difference."""
+    next_potentials = [*potentials[1:], 0.0]
+    return [
+        scale * (gamma * next_potential - potential)
+        for potential, next_potential in zip(potentials, next_potentials, strict=True)
+    ]
+
+
+def assign_episode_returns(
+    episode: list[PPOTransition],
+    terminal_return: float,
+    *,
+    gamma: float,
+    gae_lambda: float,
+    reward_shaping: str,
+    reward_shaping_scale: float,
+) -> None:
+    """Assign shaped policy advantages and unshaped terminal value targets."""
+    values = [item.old_value for item in episode]
+    base_rewards = [0.0] * len(episode)
+    if base_rewards:
+        base_rewards[-1] = terminal_return
+    base_advantages, base_targets = compute_gae(
+        values,
+        rewards=base_rewards,
+        gamma=gamma,
+        gae_lambda=gae_lambda,
+    )
+    shaping_rewards = [0.0] * len(episode)
+    policy_advantages = base_advantages
+    if reward_shaping == "prize":
+        shaping_rewards = potential_shaping_rewards(
+            [item.potential for item in episode],
+            gamma=gamma,
+            scale=reward_shaping_scale,
+        )
+        policy_advantages, _ = compute_gae(
+            values,
+            rewards=[
+                reward + shaping
+                for reward, shaping in zip(base_rewards, shaping_rewards, strict=True)
+            ],
+            gamma=gamma,
+            gae_lambda=gae_lambda,
+        )
+    elif reward_shaping != "none":
+        raise ValueError(f"Unsupported reward shaping mode: {reward_shaping}")
+
+    for item, advantage, target, shaping in zip(
+        episode,
+        policy_advantages,
+        base_targets,
+        shaping_rewards,
+        strict=True,
+    ):
+        item.advantage = advantage
+        item.value_target = max(-1.0, min(1.0, target))
+        item.shaping_reward = shaping
 
 
 def explained_variance(values: list[float], targets: list[float]) -> float:
@@ -366,6 +458,11 @@ def _collect_rollout_shard(task: _WorkerRolloutTask) -> list[_WorkerGameResult]:
                             action=action[0],
                             old_log_probability=float(log_probability.item()),
                             old_value=float(value.item()),
+                            potential=(
+                                prize_potential(observation, learning_player)
+                                if task.reward_shaping == "prize"
+                                else 0.0
+                            ),
                         )
                     )
                 observation = context.engine.select(action)
@@ -374,18 +471,14 @@ def _collect_rollout_shard(task: _WorkerRolloutTask) -> list[_WorkerGameResult]:
             terminal_return = (
                 0.0 if winner == 2 else (1.0 if winner == learning_player else -1.0)
             )
-            values = [item.old_value for item in episode]
-            advantages, targets = compute_gae(
-                values,
+            assign_episode_returns(
+                episode,
                 terminal_return,
                 gamma=task.gamma,
                 gae_lambda=task.gae_lambda,
+                reward_shaping=task.reward_shaping,
+                reward_shaping_scale=task.reward_shaping_scale,
             )
-            for item, advantage, target in zip(
-                episode, advantages, targets, strict=True
-            ):
-                item.advantage = advantage
-                item.value_target = max(-1.0, min(1.0, target))
             results.append(
                 _WorkerGameResult(
                     game=game,
@@ -409,6 +502,8 @@ def collect_rollout_parallel(
     opponent_pool: OpponentPool,
     gamma: float,
     gae_lambda: float,
+    reward_shaping: str,
+    reward_shaping_scale: float,
 ) -> tuple[list[PPOTransition], list[float], list[str]]:
     """Collect rollout shards concurrently in process-isolated simulators."""
     opponent_names = [opponent_pool.sample_name() for _ in range(games)]
@@ -426,6 +521,8 @@ def collect_rollout_parallel(
                 seed=seed,
                 gamma=gamma,
                 gae_lambda=gae_lambda,
+                reward_shaping=reward_shaping,
+                reward_shaping_scale=reward_shaping_scale,
             ),
         )
         for indices, names in assignments
@@ -454,6 +551,8 @@ def collect_rollout(
     attack_catalog: dict[int, object],
     gamma: float,
     gae_lambda: float,
+    reward_shaping: str,
+    reward_shaping_scale: float,
 ) -> tuple[list[PPOTransition], list[float], list[str]]:
     transitions: list[PPOTransition] = []
     outcomes: list[float] = []
@@ -502,6 +601,11 @@ def collect_rollout(
                             action=action[0],
                             old_log_probability=float(log_probability.item()),
                             old_value=float(value.item()),
+                            potential=(
+                                prize_potential(observation, learning_player)
+                                if reward_shaping == "prize"
+                                else 0.0
+                            ),
                         )
                     )
                 observation = engine.select(action)
@@ -509,16 +613,14 @@ def collect_rollout(
             winner = int(observation["current"]["result"])
             terminal_return = 0.0 if winner == 2 else (1.0 if winner == learning_player else -1.0)
             outcomes.append(terminal_return)
-            values = [item.old_value for item in episode]
-            advantages, targets = compute_gae(
-                values,
+            assign_episode_returns(
+                episode,
                 terminal_return,
                 gamma=gamma,
                 gae_lambda=gae_lambda,
+                reward_shaping=reward_shaping,
+                reward_shaping_scale=reward_shaping_scale,
             )
-            for item, advantage, target in zip(episode, advantages, targets, strict=True):
-                item.advantage = advantage
-                item.value_target = max(-1.0, min(1.0, target))
             transitions.extend(episode)
         finally:
             engine.finish()
@@ -571,6 +673,8 @@ def iteration_log_values(metrics: IterationMetrics) -> dict[str, int | float]:
         "time/update_seconds": metrics.update_seconds,
         "time/iteration_seconds": metrics.rollout_seconds + metrics.update_seconds,
         "performance/games_per_second": metrics.games_per_second,
+        "reward/mean_abs_shaping_reward": metrics.mean_abs_shaping_reward,
+        "reward/mean_shaping_return": metrics.mean_shaping_return,
     }
     for name, result in metrics.opponents.items():
         opponent_games = max(int(result["games"]), 1)
@@ -763,6 +867,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--gamma", type=float, default=1.0)
     parser.add_argument("--gae-lambda", type=float, default=0.95)
+    parser.add_argument(
+        "--reward-shaping",
+        choices=("none", "prize"),
+        default="none",
+        help="Optional potential-based policy reward shaping.",
+    )
+    parser.add_argument(
+        "--reward-shaping-scale",
+        type=float,
+        default=1.0,
+        help="Scale applied to potential differences; ignored when shaping is disabled.",
+    )
     parser.add_argument("--clip-ratio", type=float, default=0.2)
     parser.add_argument("--value-coefficient", type=float, default=0.25)
     parser.add_argument("--entropy-coefficient", type=float, default=0.01)
@@ -830,6 +946,8 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("--rollout-workers must be at least one")
     if args.worker_torch_threads < 1:
         raise ValueError("--worker-torch-threads must be at least one")
+    if args.reward_shaping_scale < 0.0:
+        raise ValueError("--reward-shaping-scale must be non-negative")
     if args.rollout_workers > 1 and args.rollout_device != "cpu":
         raise ValueError("Parallel rollout requires --rollout-device=cpu")
     torch.manual_seed(args.seed)
@@ -900,6 +1018,8 @@ def main(argv: list[str] | None = None) -> int:
                     attack_catalog=attack_catalog,
                     gamma=args.gamma,
                     gae_lambda=args.gae_lambda,
+                    reward_shaping=args.reward_shaping,
+                    reward_shaping_scale=args.reward_shaping_scale,
                 )
             else:
                 transitions, outcomes, opponent_names = collect_rollout_parallel(
@@ -911,6 +1031,8 @@ def main(argv: list[str] | None = None) -> int:
                     opponent_pool=opponent_pool,
                     gamma=args.gamma,
                     gae_lambda=args.gae_lambda,
+                    reward_shaping=args.reward_shaping,
+                    reward_shaping_scale=args.reward_shaping_scale,
                 )
             rollout_seconds = time.perf_counter() - rollout_started
             if not transitions:
@@ -955,6 +1077,15 @@ def main(argv: list[str] | None = None) -> int:
                 rollout_seconds=round(rollout_seconds, 4),
                 update_seconds=round(update_seconds, 4),
                 games_per_second=round(len(outcomes) / rollout_seconds, 4),
+                mean_abs_shaping_reward=round(
+                    sum(abs(item.shaping_reward) for item in transitions)
+                    / len(transitions),
+                    6,
+                ),
+                mean_shaping_return=round(
+                    sum(item.shaping_reward for item in transitions) / len(outcomes),
+                    6,
+                ),
                 opponents=summarize_opponent_results(opponent_names, outcomes),
                 sampling_weights=opponent_pool.effective_weights(),
             )

@@ -64,5 +64,30 @@ faster once CPU cores, memory bandwidth, model replication, or process communica
 bottleneck. Keep `POKETCG_ROLLOUT_DEVICE=cpu`: batch-one CUDA inference can be slower because every
 game decision adds a synchronization point.
 
+## Prize-progress potential shaping
+
+Potential-based shaping is optional and disabled by default. Enable it for an experiment with:
+
+```bash
+POKETCG_REWARD_SHAPING=prize \
+POKETCG_REWARD_SHAPING_SCALE=1.0 \
+POKETCG_GAE_LAMBDA=0.95 \
+WANDB_RUN_NAME=ppo-v2-prize-pbrs \
+bash scripts/train_colab_ppo.sh INPUT.pt OUTPUT.pt
+```
+
+For learner `i`, the potential is the normalized relative prize progress
+`Phi(s) = (opponent_prizes_remaining - own_prizes_remaining) / 6`. The shaped reward is
+`scale * (gamma * Phi(next_state) - Phi(state))`; terminal potential is forced to zero. This gives
+the actor immediate credit when prize progress improves while preserving the original optimal
+policy under the usual potential-shaping assumptions. The critic deliberately keeps the unshaped
+terminal win/loss target, so its value remains interpretable on `[-1, 1]`.
+
+W&B adds `reward/mean_abs_shaping_reward` and `reward/mean_shaping_return`. The former should be
+positive when prize counts change; with `gamma=1`, the latter should remain close to zero across
+many games because potential differences telescope. Use the same starting checkpoint and seed with
+`POKETCG_REWARD_SHAPING=none` for a controlled A/B comparison. The script also accepts
+`POKETCG_ITERATIONS` and `POKETCG_GAMES_PER_ITERATION` overrides.
+
 If the GitHub repository is private, authenticate the clone through a Colab Secret or clone it
 manually. Do not put a personal access token directly in the notebook.

@@ -8,6 +8,11 @@ INPUT_CHECKPOINT="${1:-/content/drive/MyDrive/pokemonTCG/checkpoints/bc_rule_v2_
 OUTPUT_CHECKPOINT="${2:-/content/drive/MyDrive/pokemonTCG/checkpoints/ppo_v2_parallel_colab.pt}"
 ROLLOUT_DEVICE="${POKETCG_ROLLOUT_DEVICE:-cpu}"
 ROLLOUT_WORKERS="${POKETCG_ROLLOUT_WORKERS:-8}"
+ITERATIONS="${POKETCG_ITERATIONS:-40}"
+GAMES_PER_ITERATION="${POKETCG_GAMES_PER_ITERATION:-512}"
+GAE_LAMBDA="${POKETCG_GAE_LAMBDA:-1.0}"
+REWARD_SHAPING="${POKETCG_REWARD_SHAPING:-none}"
+REWARD_SHAPING_SCALE="${POKETCG_REWARD_SHAPING_SCALE:-1.0}"
 WANDB_MODE="${WANDB_MODE:-online}"
 WANDB_PROJECT="${WANDB_PROJECT:-pokemon-tcg-ai-battle}"
 WANDB_RUN_NAME="${WANDB_RUN_NAME:-ppo-v2-parallel-8w}"
@@ -39,13 +44,15 @@ python -c 'import torch; assert torch.cuda.is_available(), "CUDA GPU is not avai
 python -m poketcg.rl.train_ppo \
   --input "$INPUT_CHECKPOINT" \
   --output "$OUTPUT_CHECKPOINT" \
-  --iterations 40 \
-  --games-per-iteration 512 \
+  --iterations "$ITERATIONS" \
+  --games-per-iteration "$GAMES_PER_ITERATION" \
   --ppo-epochs 4 \
   --batch-size 512 \
   --learning-rate 0.00005 \
   --gamma 1.0 \
-  --gae-lambda 1.0 \
+  --gae-lambda "$GAE_LAMBDA" \
+  --reward-shaping "$REWARD_SHAPING" \
+  --reward-shaping-scale "$REWARD_SHAPING_SCALE" \
   --device cuda \
   --rollout-device "$ROLLOUT_DEVICE" \
   --rollout-workers "$ROLLOUT_WORKERS" \

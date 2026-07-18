@@ -2,6 +2,7 @@ import argparse
 import importlib
 from pathlib import Path
 
+import pytest
 import torch
 
 from poketcg.rl.collect_bc import optimal_policy_target
@@ -15,11 +16,15 @@ from poketcg.rl.model import (
 from poketcg.rl.opponent_pool import OpponentPool
 from poketcg.rl.train_ppo import (
     IterationMetrics,
+    PPOTransition,
+    assign_episode_returns,
     compute_gae,
     explained_variance,
     initialize_wandb,
     iteration_log_values,
     partition_rollout_assignments,
+    potential_shaping_rewards,
+    prize_potential,
     summarize_opponent_results,
 )
 
@@ -125,6 +130,66 @@ def test_gae_uses_terminal_reward_on_final_player_decision() -> None:
     assert targets == [0.5, 1.0]
 
 
+def test_gae_accepts_dense_per_step_rewards() -> None:
+    advantages, targets = compute_gae(
+        [0.0, 0.0],
+        rewards=[0.2, 0.8],
+        gamma=1.0,
+        gae_lambda=1.0,
+    )
+
+    assert advantages == pytest.approx([1.0, 0.8])
+    assert targets == pytest.approx([1.0, 0.8])
+
+
+def test_prize_potential_is_relative_progress_from_learning_player() -> None:
+    observation = {
+        "current": {
+            "players": [
+                {"prize": [1, 2, 3, 4]},
+                {"prize": [1, 2, 3, 4, 5, 6]},
+            ]
+        }
+    }
+
+    assert prize_potential(observation, 0) == pytest.approx(2.0 / 6.0)
+    assert prize_potential(observation, 1) == pytest.approx(-2.0 / 6.0)
+
+
+def test_prize_shaping_telescopes_to_zero_with_terminal_zero_potential() -> None:
+    rewards = potential_shaping_rewards(
+        [0.0, 1.0 / 6.0, 2.0 / 6.0],
+        gamma=1.0,
+        scale=1.0,
+    )
+
+    assert rewards == pytest.approx([1.0 / 6.0, 1.0 / 6.0, -2.0 / 6.0])
+    assert sum(rewards) == pytest.approx(0.0)
+
+
+def test_prize_shaping_changes_actor_advantage_but_not_critic_target() -> None:
+    episode = [
+        PPOTransition(_example(2).decision, 0, 0.0, 0.0, potential=0.0),
+        PPOTransition(_example(2).decision, 0, 0.0, 0.0, potential=1.0 / 6.0),
+    ]
+    assign_episode_returns(
+        episode,
+        terminal_return=1.0,
+        gamma=1.0,
+        gae_lambda=0.5,
+        reward_shaping="prize",
+        reward_shaping_scale=1.0,
+    )
+
+    assert [item.shaping_reward for item in episode] == pytest.approx(
+        [1.0 / 6.0, -1.0 / 6.0]
+    )
+    assert [item.advantage for item in episode] == pytest.approx(
+        [7.0 / 12.0, 5.0 / 6.0]
+    )
+    assert [item.value_target for item in episode] == pytest.approx([0.5, 1.0])
+
+
 def test_explained_variance_handles_perfect_and_constant_targets() -> None:
     assert explained_variance([-1.0, 0.0, 1.0], [-1.0, 0.0, 1.0]) == 1.0
     assert explained_variance([0.0, 0.0], [1.0, 1.0]) == 0.0
@@ -158,6 +223,8 @@ def test_iteration_log_values_flattens_training_and_opponent_metrics() -> None:
         rollout_seconds=2.0,
         update_seconds=0.5,
         games_per_second=4.0,
+        mean_abs_shaping_reward=0.02,
+        mean_shaping_return=0.0,
         opponents={
             "rule": {
                 "games": 4,
