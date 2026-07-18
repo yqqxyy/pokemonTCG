@@ -152,6 +152,10 @@ python -m poketcg.rl.train_ppo \
 CPU 上逐动作推理通常更快，而 MPS 适合批量反向传播。训练会额外保存每 5 轮 checkpoint，
 不要仅凭单轮 rollout 回报选择模型，应使用固定对手面板复评。
 
+在多核 Linux/Colab 上可增加 `--rollout-workers 8 --worker-torch-threads 1`，用 `spawn`
+启动进程隔离的官方模拟器。传入 `--wandb-mode online --wandb-project PROJECT` 可由主进程
+实时记录 PPO、胜率、PFSP、吞吐和系统指标；API key 只应通过环境变量或 Colab Secret 提供。
+
 评估 checkpoint 的离线指标和固定对手面板：
 
 ```bash

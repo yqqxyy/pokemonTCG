@@ -72,6 +72,7 @@ class _PoolEntry:
     kind: str
     weight: float
     model: PolicyValueModel | None = None
+    model_config: dict[str, Any] | None = None
     encoder_version: int = 1
     games: int = 0
     score_sum: float = 0.0
@@ -151,6 +152,7 @@ class OpponentPool:
                 kind="policy",
                 weight=weight,
                 model=model,
+                model_config=dict(saved["model_config"]),
                 encoder_version=encoder_version(saved["model_config"]),
             )
         )
@@ -171,6 +173,7 @@ class OpponentPool:
                 kind="snapshot",
                 weight=0.0,
                 model=frozen,
+                model_config=dict(model_config),
                 encoder_version=encoder_version(model_config),
             )
         )
@@ -274,3 +277,23 @@ class OpponentPool:
             item.name: round(effective_weight, 6)
             for item, _, effective_weight in self._weighted_entries()
         }
+
+    def worker_state(self) -> list[dict[str, Any]]:
+        """Export immutable opponent definitions for spawned rollout workers."""
+        state: list[dict[str, Any]] = []
+        for entry, _, _ in self._weighted_entries():
+            item: dict[str, Any] = {
+                "name": entry.name,
+                "kind": entry.kind,
+                "encoder_version": entry.encoder_version,
+            }
+            if entry.model is not None:
+                if entry.model_config is None:
+                    raise RuntimeError(f"Opponent {entry.name} has no model configuration.")
+                item["model_config"] = dict(entry.model_config)
+                item["model_state_dict"] = {
+                    key: value.detach().cpu().clone()
+                    for key, value in entry.model.state_dict().items()
+                }
+            state.append(item)
+        return state

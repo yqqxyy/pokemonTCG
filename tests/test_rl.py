@@ -1,3 +1,7 @@
+import argparse
+import importlib
+from pathlib import Path
+
 import torch
 
 from poketcg.rl.collect_bc import optimal_policy_target
@@ -9,7 +13,15 @@ from poketcg.rl.model import (
     categorical_value_targets,
 )
 from poketcg.rl.opponent_pool import OpponentPool
-from poketcg.rl.train_ppo import compute_gae, summarize_opponent_results
+from poketcg.rl.train_ppo import (
+    IterationMetrics,
+    compute_gae,
+    explained_variance,
+    initialize_wandb,
+    iteration_log_values,
+    partition_rollout_assignments,
+    summarize_opponent_results,
+)
 
 
 def _example(option_count: int, action: int = 0) -> BCExample:
@@ -113,6 +125,91 @@ def test_gae_uses_terminal_reward_on_final_player_decision() -> None:
     assert targets == [0.5, 1.0]
 
 
+def test_explained_variance_handles_perfect_and_constant_targets() -> None:
+    assert explained_variance([-1.0, 0.0, 1.0], [-1.0, 0.0, 1.0]) == 1.0
+    assert explained_variance([0.0, 0.0], [1.0, 1.0]) == 0.0
+
+
+def test_partition_rollout_assignments_balances_and_preserves_order() -> None:
+    names = [f"opponent-{index}" for index in range(10)]
+    shards = partition_rollout_assignments(names, workers=3)
+
+    assert [len(indices) for indices, _ in shards] == [4, 3, 3]
+    assert [index for indices, _ in shards for index in indices] == list(range(10))
+    assert [name for _, shard_names in shards for name in shard_names] == names
+
+
+def test_iteration_log_values_flattens_training_and_opponent_metrics() -> None:
+    metrics = IterationMetrics(
+        iteration=3,
+        games=8,
+        wins=5,
+        draws=1,
+        losses=2,
+        transitions=120,
+        mean_return=0.375,
+        policy_loss=-0.01,
+        value_loss=2.0,
+        entropy=0.8,
+        approximate_kl=0.005,
+        clip_fraction=0.1,
+        explained_variance=0.4,
+        gradient_norm=1.5,
+        rollout_seconds=2.0,
+        update_seconds=0.5,
+        games_per_second=4.0,
+        opponents={
+            "rule": {
+                "games": 4,
+                "wins": 3,
+                "draws": 0,
+                "losses": 1,
+                "mean_return": 0.5,
+            }
+        },
+        sampling_weights={"rule": 0.5},
+    )
+
+    values = iteration_log_values(metrics)
+
+    assert values["rollout/win_rate"] == 0.625
+    assert values["opponent/rule/win_rate"] == 0.75
+    assert values["sampling_weight/rule"] == 0.5
+    assert values["time/iteration_seconds"] == 2.5
+
+
+def test_initialize_wandb_passes_safe_configuration(monkeypatch) -> None:
+    captured: dict = {}
+
+    class FakeWandb:
+        @staticmethod
+        def init(**options):
+            captured.update(options)
+            return object()
+
+    real_import_module = importlib.import_module
+
+    def fake_import_module(name: str):
+        return FakeWandb if name == "wandb" else real_import_module(name)
+
+    monkeypatch.setattr(importlib, "import_module", fake_import_module)
+    args = argparse.Namespace(
+        wandb_mode="offline",
+        wandb_project="poketcg-test",
+        wandb_entity=None,
+        wandb_run_name="smoke",
+        wandb_run_id=None,
+        input=Path("checkpoint.pt"),
+    )
+
+    initialize_wandb(args)
+
+    assert captured["mode"] == "offline"
+    assert captured["project"] == "poketcg-test"
+    assert captured["config"]["input"] == "checkpoint.pt"
+    assert "wandb_run_id" not in captured["config"]
+
+
 def test_optimal_policy_target_is_uniform_over_ties() -> None:
     assert optimal_policy_target([2.0, 5.0, 5.0, 1.0]) == [0.0, 0.5, 0.5, 0.0]
 
@@ -175,6 +272,15 @@ def test_opponent_pool_splits_snapshot_group_weight_and_evicts_oldest() -> None:
             "ema_win_rate": 0.5,
         },
     ]
+    worker_state = pool.worker_state()
+    assert [item["name"] for item in worker_state] == [
+        "random",
+        "rule",
+        "snapshot2",
+        "snapshot3",
+    ]
+    assert worker_state[2]["model_config"] == config
+    assert "model_state_dict" in worker_state[2]
 
 
 def test_win_rate_adaptive_sampling_downweights_easy_opponents() -> None:
