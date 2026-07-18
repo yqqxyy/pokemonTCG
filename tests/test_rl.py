@@ -177,6 +177,7 @@ def test_prize_shaping_changes_actor_advantage_but_not_critic_target() -> None:
         terminal_return=1.0,
         gamma=1.0,
         gae_lambda=0.5,
+        value_gae_lambda=0.5,
         reward_shaping="prize",
         reward_shaping_scale=1.0,
     )
@@ -188,6 +189,25 @@ def test_prize_shaping_changes_actor_advantage_but_not_critic_target() -> None:
         [7.0 / 12.0, 5.0 / 6.0]
     )
     assert [item.value_target for item in episode] == pytest.approx([0.5, 1.0])
+
+
+def test_value_lambda_can_use_monte_carlo_targets_with_shorter_policy_gae() -> None:
+    episode = [
+        PPOTransition(_example(2).decision, 0, 0.0, 0.0),
+        PPOTransition(_example(2).decision, 0, 0.0, 0.0),
+    ]
+    assign_episode_returns(
+        episode,
+        terminal_return=1.0,
+        gamma=1.0,
+        gae_lambda=0.5,
+        value_gae_lambda=1.0,
+        reward_shaping="none",
+        reward_shaping_scale=1.0,
+    )
+
+    assert [item.advantage for item in episode] == pytest.approx([0.5, 1.0])
+    assert [item.value_target for item in episode] == pytest.approx([1.0, 1.0])
 
 
 def test_explained_variance_handles_perfect_and_constant_targets() -> None:

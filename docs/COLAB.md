@@ -21,7 +21,7 @@ The default training command uses:
 - eight spawned CPU workers, each with an isolated official simulator;
 - 512 games per iteration;
 - batch size 512;
-- GAE lambda 1.0 while the V2 critic is being established;
+- Actor GAE lambda 0.95 with an independently configured critic lambda of 1.0;
 - PFSP population sampling with a reduced historical self-play weight;
 - checkpoints written to Drive every two iterations;
 - live experiment and system metrics in a W&B project named `pokemon-tcg-ai-battle`.
@@ -72,6 +72,7 @@ Potential-based shaping is optional and disabled by default. Enable it for an ex
 POKETCG_REWARD_SHAPING=prize \
 POKETCG_REWARD_SHAPING_SCALE=1.0 \
 POKETCG_GAE_LAMBDA=0.95 \
+POKETCG_VALUE_GAE_LAMBDA=1.0 \
 WANDB_RUN_NAME=ppo-v2-prize-pbrs \
 bash scripts/train_colab_ppo.sh INPUT.pt OUTPUT.pt
 ```
@@ -88,6 +89,24 @@ positive when prize counts change; with `gamma=1`, the latter should remain clos
 many games because potential differences telescope. Use the same starting checkpoint and seed with
 `POKETCG_REWARD_SHAPING=none` for a controlled A/B comparison. The script also accepts
 `POKETCG_ITERATIONS` and `POKETCG_GAMES_PER_ITERATION` overrides.
+
+## Decoupled actor and critic lambda
+
+The Colab script now defaults to `POKETCG_GAE_LAMBDA=0.95` for policy advantages and
+`POKETCG_VALUE_GAE_LAMBDA=1.0` for critic targets. With `gamma=1`, the latter telescopes to the
+actual terminal outcome at every learner decision, while the actor keeps the lower-variance GAE
+estimate. To run the terminal-reward experiment from the original population checkpoint:
+
+```bash
+POKETCG_REWARD_SHAPING=none \
+POKETCG_GAE_LAMBDA=0.95 \
+POKETCG_VALUE_GAE_LAMBDA=1.0 \
+WANDB_RUN_NAME=ppo-v2-terminal-value-mc \
+bash scripts/train_colab_ppo.sh INPUT_ITER0030.pt OUTPUT.pt
+```
+
+The Python CLI remains backward compatible: if `--value-gae-lambda` is omitted, it inherits
+`--gae-lambda`. Checkpoint `ppo_config` records both resolved numeric values.
 
 ## Value calibration and trajectories
 

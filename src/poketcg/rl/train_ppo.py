@@ -98,6 +98,7 @@ class _WorkerRolloutTask:
     seed: int
     gamma: float
     gae_lambda: float
+    value_gae_lambda: float
     reward_shaping: str
     reward_shaping_scale: float
 
@@ -206,6 +207,7 @@ def assign_episode_returns(
     *,
     gamma: float,
     gae_lambda: float,
+    value_gae_lambda: float,
     reward_shaping: str,
     reward_shaping_scale: float,
 ) -> None:
@@ -214,11 +216,17 @@ def assign_episode_returns(
     base_rewards = [0.0] * len(episode)
     if base_rewards:
         base_rewards[-1] = terminal_return
-    base_advantages, base_targets = compute_gae(
+    base_advantages, _ = compute_gae(
         values,
         rewards=base_rewards,
         gamma=gamma,
         gae_lambda=gae_lambda,
+    )
+    _, base_targets = compute_gae(
+        values,
+        rewards=base_rewards,
+        gamma=gamma,
+        gae_lambda=value_gae_lambda,
     )
     shaping_rewards = [0.0] * len(episode)
     policy_advantages = base_advantages
@@ -476,6 +484,7 @@ def _collect_rollout_shard(task: _WorkerRolloutTask) -> list[_WorkerGameResult]:
                 terminal_return,
                 gamma=task.gamma,
                 gae_lambda=task.gae_lambda,
+                value_gae_lambda=task.value_gae_lambda,
                 reward_shaping=task.reward_shaping,
                 reward_shaping_scale=task.reward_shaping_scale,
             )
@@ -502,6 +511,7 @@ def collect_rollout_parallel(
     opponent_pool: OpponentPool,
     gamma: float,
     gae_lambda: float,
+    value_gae_lambda: float,
     reward_shaping: str,
     reward_shaping_scale: float,
 ) -> tuple[list[PPOTransition], list[float], list[str]]:
@@ -521,6 +531,7 @@ def collect_rollout_parallel(
                 seed=seed,
                 gamma=gamma,
                 gae_lambda=gae_lambda,
+                value_gae_lambda=value_gae_lambda,
                 reward_shaping=reward_shaping,
                 reward_shaping_scale=reward_shaping_scale,
             ),
@@ -551,6 +562,7 @@ def collect_rollout(
     attack_catalog: dict[int, object],
     gamma: float,
     gae_lambda: float,
+    value_gae_lambda: float,
     reward_shaping: str,
     reward_shaping_scale: float,
 ) -> tuple[list[PPOTransition], list[float], list[str]]:
@@ -618,6 +630,7 @@ def collect_rollout(
                 terminal_return,
                 gamma=gamma,
                 gae_lambda=gae_lambda,
+                value_gae_lambda=value_gae_lambda,
                 reward_shaping=reward_shaping,
                 reward_shaping_scale=reward_shaping_scale,
             )
@@ -868,6 +881,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gamma", type=float, default=1.0)
     parser.add_argument("--gae-lambda", type=float, default=0.95)
     parser.add_argument(
+        "--value-gae-lambda",
+        type=float,
+        help=(
+            "Independent lambda for critic targets. Defaults to --gae-lambda for backward "
+            "compatibility; use 1.0 for Monte Carlo targets when gamma is 1.0."
+        ),
+    )
+    parser.add_argument(
         "--reward-shaping",
         choices=("none", "prize"),
         default="none",
@@ -942,12 +963,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.value_gae_lambda is None:
+        args.value_gae_lambda = args.gae_lambda
     if args.rollout_workers < 1:
         raise ValueError("--rollout-workers must be at least one")
     if args.worker_torch_threads < 1:
         raise ValueError("--worker-torch-threads must be at least one")
     if args.reward_shaping_scale < 0.0:
         raise ValueError("--reward-shaping-scale must be non-negative")
+    if not 0.0 <= args.gae_lambda <= 1.0:
+        raise ValueError("--gae-lambda must be in [0, 1]")
+    if not 0.0 <= args.value_gae_lambda <= 1.0:
+        raise ValueError("--value-gae-lambda must be in [0, 1]")
     if args.rollout_workers > 1 and args.rollout_device != "cpu":
         raise ValueError("Parallel rollout requires --rollout-device=cpu")
     torch.manual_seed(args.seed)
@@ -1018,6 +1045,7 @@ def main(argv: list[str] | None = None) -> int:
                     attack_catalog=attack_catalog,
                     gamma=args.gamma,
                     gae_lambda=args.gae_lambda,
+                    value_gae_lambda=args.value_gae_lambda,
                     reward_shaping=args.reward_shaping,
                     reward_shaping_scale=args.reward_shaping_scale,
                 )
@@ -1031,6 +1059,7 @@ def main(argv: list[str] | None = None) -> int:
                     opponent_pool=opponent_pool,
                     gamma=args.gamma,
                     gae_lambda=args.gae_lambda,
+                    value_gae_lambda=args.value_gae_lambda,
                     reward_shaping=args.reward_shaping,
                     reward_shaping_scale=args.reward_shaping_scale,
                 )
