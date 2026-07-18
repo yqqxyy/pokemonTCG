@@ -89,5 +89,35 @@ many games because potential differences telescope. Use the same starting checkp
 `POKETCG_REWARD_SHAPING=none` for a controlled A/B comparison. The script also accepts
 `POKETCG_ITERATIONS` and `POKETCG_GAMES_PER_ITERATION` overrides.
 
+## Value calibration and trajectories
+
+Run the diagnostic against the same deterministic RuleAgent panel used for checkpoint comparison:
+
+```bash
+python -m poketcg.rl.value_diagnostics \
+  --checkpoint /content/drive/MyDrive/pokemonTCG/checkpoints/MODEL.pt \
+  --opponent rule --games-per-seat 500 --device cpu \
+  --output /content/drive/MyDrive/pokemonTCG/results/MODEL_value_rule500.json
+```
+
+The command writes the aggregate JSON plus `MODEL_value_rule500_trajectories.jsonl`. Interpret the
+main fields as follows:
+
+- lower `mae`, `rmse`, `brier_score`, and `expected_calibration_error` are better;
+- positive correlation and explained variance indicate that values rank eventual outcomes;
+- `calibration_slope` near one and `calibration_intercept` near zero indicate calibrated scale;
+- a slope below one usually indicates over-dispersed/overconfident predictions, while a slope above
+  one indicates predictions that are too compressed;
+- late-game diagnostics should normally be stronger than early-game diagnostics; `setup` is kept
+  separate because the official engine reports empty prize lists before cards are dealt;
+- `mean_net_change_toward_outcome` should be positive, and high-confidence wrong-sign states should
+  be uncommon;
+- large Player 0/1 gaps reveal seat-conditioned bias even when aggregate metrics look acceptable.
+
+Calibration rows are decision-weighted, so long games contribute more states. The `per_game` section
+is included to check that a result is not caused only by a few unusually long trajectories. Add
+`--stochastic` only when deliberately diagnosing the sampled training policy rather than reproducing
+the deterministic fixed panel.
+
 If the GitHub repository is private, authenticate the clone through a Colab Secret or clone it
 manually. Do not put a personal access token directly in the notebook.

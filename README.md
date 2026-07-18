@@ -176,6 +176,21 @@ python -m poketcg.rl.evaluate_panel \
   --output results/evaluation/ppo_rule_v1_soft_20_iter0020_final500.json
 ```
 
+对官方引擎中的完整对局做 on-policy Value calibration 与轨迹诊断：
+
+```bash
+python -m poketcg.rl.value_diagnostics \
+  --checkpoint artifacts/checkpoints/ppo_v2_parallel_colab_iter0030.pt \
+  --opponent rule --games-per-seat 500 --device cpu \
+  --output results/diagnostics/ppo_v2_iter0030_value_rule500.json
+```
+
+该入口按总体、Player 0/1、奖励卡阶段和决策 context 报告 Value MAE、RMSE、Brier score、
+Pearson correlation、explained variance、calibration slope/intercept 和 ECE；同时报告逐局
+初始/最终 Value、朝最终结果方向的净变化、轨迹波动、符号翻转和高置信错误。指定 `--output`
+时还会自动写出同名前缀的 `_trajectories.jsonl`，每行是一个模型实际参与的决策状态。
+默认 deterministic 与固定评测面板一致；研究训练时的随机策略分布可增加 `--stochastic`。
+
 当前固定面板（每个对手、每个座位各 500 局）的结果：软标签 BC 对 RuleAgent 的双座位
 平均胜率为 49.6%，PPO iter20 为 58.0%；对 Random 分别为 90.6% 和 90.3%。
 

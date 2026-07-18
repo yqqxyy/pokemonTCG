@@ -28,6 +28,7 @@ poketcg-collect-bc = "poketcg.rl.collect_bc:main"
 poketcg-train-bc = "poketcg.rl.train_bc:main"
 poketcg-train-ppo = "poketcg.rl.train_ppo:main"
 poketcg-diagnose = "poketcg.rl.diagnose:main"
+poketcg-value-diagnostics = "poketcg.rl.value_diagnostics:main"
 poketcg-evaluate-panel = "poketcg.rl.evaluate_panel:main"
 
 
