@@ -132,10 +132,45 @@ python -m poketcg.rl.train_bc \
   --device mps --seed 20260720
 ```
 
-该模型有 4,110,694 个参数；训练会按 token 长度分桶，减少 attention padding。V1/V2
+该模型有 4,110,694 个参数；训练会按 token 长度分桶，减少 attention padding。V1/V2/V3
 checkpoint 由同一套 Agent、PPO 和诊断入口自动识别。软标签 BC 应优先使用 stochastic 评测；
 deterministic argmax 会固定选择大量同分动作中的一个，行为可能明显偏离 RuleAgent 的随机
 tie-breaking。当前 V2 全量 Value MAE 为 0.652，V1 BC 为约 0.842；V2 PPO 管线已通过冒烟测试。
+
+## FeatureEncoder V3：结构化卡牌语义与事件历史
+
+V3 保留 V2 的所有可见状态 token，并增加：
+
+- 40 维卡牌/攻击效果语义，包括搜索、抽牌、弃牌、能量加速、伤害缩放、防伤、换位、状态、
+  奖品和条件触发，以及印刷伤害、能耗和文本规模等数值；
+- observation 中最近 32 条可见引擎事件，包括事件类型、相对玩家、源/目标卡牌、攻击、区域
+  变化、数值及相对时序；
+- option 级语义，使攻击和卡牌候选不只依赖离散 ID embedding。
+
+语义在运行时从官方 catalog 解析，不生成或提交派生卡牌文本文件。重新采集 V3 BC 数据：
+
+```bash
+python -m poketcg.rl.collect_bc \
+  --games 2000 --encoder-version 3 --seed 20260724 \
+  --output artifacts/bc/rule_v3_semantic_history_2000.jsonl
+```
+
+训练完整 V3（4,141,414 参数）：
+
+```bash
+python -m poketcg.rl.train_bc \
+  --input artifacts/bc/rule_v3_semantic_history_2000.jsonl \
+  --output artifacts/checkpoints/bc_rule_v3_semantic_history_2000.pt \
+  --epochs 10 --batch-size 64 --learning-rate 0.0002 \
+  --hidden-size 256 --model-type transformer_v3 \
+  --num-layers 3 --num-heads 4 --dropout 0.1 \
+  --device mps --seed 20260724
+```
+
+同一份 V3 数据可直接做四组严格消融。分别增加 `--disable-card-semantics`、
+`--disable-history`，或同时增加两者；checkpoint 会记录开关，之后 BC Agent、PPO、对手池、
+固定面板和 Value diagnostics 会自动恢复相同结构。V3 仍只学习单选决策，多选动作暂时保留
+RuleAgent fallback，避免把输入升级和动作空间升级混在同一轮实验中。
 
 用 GAE + Masked PPO 继续对 RuleAgent 微调：
 

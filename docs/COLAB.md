@@ -156,5 +156,35 @@ watch. Context-level win rates are observational diagnostics, not causal estimat
 context helps or hurts. The command also audits card/attack ID ranges, the active deck, and public
 engine logs; its companion `_records.jsonl` file supports deeper analysis without another rollout.
 
+## Train FeatureEncoder V3 before PPO
+
+V3 adds runtime-derived structured card/attack semantics and up to 32 recent visible engine-event
+tokens. Collect a fresh dataset because V1/V2 JSONL files do not contain these fields:
+
+```bash
+mkdir -p /content/drive/MyDrive/pokemonTCG/bc
+python -m poketcg.rl.collect_bc \
+  --games 2000 --encoder-version 3 --seed 20260724 \
+  --output /content/drive/MyDrive/pokemonTCG/bc/rule_v3_semantic_history_2000.jsonl
+```
+
+Train the full V3 checkpoint on T4:
+
+```bash
+python -m poketcg.rl.train_bc \
+  --input /content/drive/MyDrive/pokemonTCG/bc/rule_v3_semantic_history_2000.jsonl \
+  --output /content/drive/MyDrive/pokemonTCG/checkpoints/bc_rule_v3_semantic_history_2000.pt \
+  --epochs 10 --batch-size 64 --learning-rate 0.0002 \
+  --hidden-size 256 --model-type transformer_v3 \
+  --num-layers 3 --num-heads 4 --dropout 0.1 \
+  --device cuda --seed 20260724
+```
+
+Run controlled ablations from the same JSONL by adding `--disable-card-semantics`,
+`--disable-history`, or both to the training command and changing the output filename. Evaluate all
+four checkpoints on the same paired-seat panel before starting PPO. Once selected, put that V3
+checkpoint into the notebook's `input_checkpoint`; the PPO trainer and spawned workers infer encoder
+V3 automatically from its model configuration.
+
 If the GitHub repository is private, authenticate the clone through a Colab Secret or clone it
 manually. Do not put a personal access token directly in the notebook.

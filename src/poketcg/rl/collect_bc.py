@@ -12,7 +12,7 @@ from poketcg.agents import RuleAgent
 from poketcg.engine import OfficialEngine
 
 from .data import BCExample, write_jsonl
-from .features import FeatureEncoder, FeatureEncoderV2
+from .features import build_feature_encoder
 
 
 def optimal_policy_target(scores: list[float], tolerance: float = 1e-6) -> list[float]:
@@ -35,12 +35,7 @@ def collect_examples(
 ) -> tuple[list[BCExample], dict]:
     card_catalog = engine.card_catalog()
     attack_catalog = engine.attack_catalog()
-    if encoder_version == 1:
-        encoder = FeatureEncoder(card_catalog, attack_catalog)
-    elif encoder_version == 2:
-        encoder = FeatureEncoderV2(card_catalog, attack_catalog)
-    else:
-        raise ValueError(f"Unsupported encoder version: {encoder_version}")
+    encoder = build_feature_encoder(encoder_version, card_catalog, attack_catalog)
     examples: list[BCExample] = []
     winners: Counter[int] = Counter()
     contexts: Counter[int] = Counter()
@@ -125,7 +120,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--deck", type=Path)
     parser.add_argument("--official-dir", type=Path)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--encoder-version", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--encoder-version", type=int, choices=(1, 2, 3), default=1)
     return parser
 
 

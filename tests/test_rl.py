@@ -1,17 +1,30 @@
 import argparse
 import importlib
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from poketcg.rl.collect_bc import optimal_policy_target
 from poketcg.rl.data import BCExample, collate_bc
-from poketcg.rl.features import OPTION_FEATURE_SIZE, STATE_FEATURE_SIZE, EncodedDecision
+from poketcg.rl.features import (
+    HISTORY_FEATURE_SIZE,
+    OPTION_FEATURE_SIZE,
+    SEMANTIC_FEATURE_SIZE,
+    SEMANTIC_TAGS,
+    STATE_FEATURE_SIZE,
+    EncodedDecision,
+    expand_semantic_features,
+    pack_semantic_features,
+    structured_semantic_features,
+)
 from poketcg.rl.model import (
     CandidatePolicyValueNet,
     TokenPolicyValueNet,
+    build_model,
     categorical_value_targets,
+    encoder_version,
 )
 from poketcg.rl.opponent_pool import OpponentPool
 from poketcg.rl.train_ppo import (
@@ -66,6 +79,34 @@ def _v2_example(token_count: int, option_count: int = 3) -> BCExample:
     return BCExample(decision, action=0, value_target=1.0, player=0, game=0)
 
 
+def _v3_example(
+    token_count: int,
+    option_count: int = 3,
+    history_count: int = 2,
+) -> BCExample:
+    example = _v2_example(token_count, option_count)
+    decision = example.decision
+    decision.version = 3
+    decision.token_semantics = [
+        [float(index == 0)] * SEMANTIC_FEATURE_SIZE for index in range(token_count)
+    ]
+    decision.option_semantics = [
+        [float(index == 1)] * SEMANTIC_FEATURE_SIZE for index in range(option_count)
+    ]
+    decision.history_features = [
+        [index / max(history_count, 1)] * HISTORY_FEATURE_SIZE
+        for index in range(history_count)
+    ]
+    decision.history_types = list(range(history_count))
+    decision.history_owners = [1] * history_count
+    decision.history_card_ids = list(range(1, history_count + 1))
+    decision.history_target_card_ids = [0] * history_count
+    decision.history_attack_ids = [0] * history_count
+    decision.history_from_zones = [2] * history_count
+    decision.history_to_zones = [4] * history_count
+    return example
+
+
 def test_collate_masks_variable_option_counts() -> None:
     batch = collate_bc([_example(2), _example(4, action=3)])
 
@@ -113,6 +154,85 @@ def test_v2_attention_model_handles_token_and_option_padding() -> None:
     assert policy_logits.shape == (2, 3)
     assert value_logits.shape == (2, 21)
     assert policy_logits[0, 2].item() < -1e20
+
+
+def test_v3_semantic_history_model_handles_independent_padding() -> None:
+    batch = collate_bc([_v3_example(0, 2, 0), _v3_example(4, 3, 2)])
+    model = TokenPolicyValueNet(
+        hidden_size=32,
+        value_bins=21,
+        num_layers=1,
+        num_heads=4,
+        dropout=0.0,
+        card_vocab_size=64,
+        attack_vocab_size=64,
+        semantic_feature_size=SEMANTIC_FEATURE_SIZE,
+        history_feature_size=HISTORY_FEATURE_SIZE,
+    )
+
+    policy_logits, value_logits = model(batch)
+    (policy_logits[:, 0].sum() + value_logits.sum()).backward()
+
+    assert batch["history_mask"].tolist() == [[False, False], [True, True]]
+    assert batch["token_semantics"].shape == (2, 4, SEMANTIC_FEATURE_SIZE)
+    assert batch["option_semantics"].shape == (2, 3, SEMANTIC_FEATURE_SIZE)
+    assert policy_logits.shape == (2, 3)
+    assert value_logits.shape == (2, 21)
+    assert policy_logits[0, 2].item() < -1e20
+
+
+@pytest.mark.parametrize(
+    ("use_card_semantics", "use_history"),
+    [(False, False), (True, False), (False, True), (True, True)],
+)
+def test_v3_model_supports_semantic_history_ablations(
+    use_card_semantics: bool,
+    use_history: bool,
+) -> None:
+    batch = collate_bc([_v3_example(2, 3, 2)])
+    config = {
+        "model_type": "transformer_v3",
+        "hidden_size": 32,
+        "value_bins": 21,
+        "num_layers": 1,
+        "num_heads": 4,
+        "dropout": 0.0,
+        "card_vocab_size": 64,
+        "attack_vocab_size": 64,
+        "use_card_semantics": use_card_semantics,
+        "use_history": use_history,
+    }
+
+    policy_logits, value_logits = build_model(config)(batch)
+
+    assert encoder_version(config) == 3
+    assert policy_logits.shape == (1, 3)
+    assert value_logits.shape == (1, 21)
+
+
+def test_structured_semantics_extract_card_effects_without_catalog_artifacts() -> None:
+    skill = SimpleNamespace(
+        text="Search your deck for up to 3 Pokemon ex, reveal them, and put them into your hand. "
+        "Then, shuffle your deck."
+    )
+    attack = SimpleNamespace(
+        text="Discard 2 Energy from this Pokemon. This attack does 20 more damage.",
+        damage=130,
+        energies=[3, 3, 0],
+    )
+
+    features = structured_semantic_features(SimpleNamespace(skills=[skill]), [attack])
+    tags = dict(zip(SEMANTIC_TAGS, features[: len(SEMANTIC_TAGS)], strict=True))
+
+    assert len(features) == SEMANTIC_FEATURE_SIZE
+    assert tags["search_deck"] == 1.0
+    assert tags["reveal"] == 1.0
+    assert tags["shuffle"] == 1.0
+    assert tags["discard"] == 1.0
+    assert tags["damage_scaling"] == 1.0
+    assert features[len(SEMANTIC_TAGS) + 1] == pytest.approx(130 / 400)
+    assert features[len(SEMANTIC_TAGS) + 4] == pytest.approx(3 / 5)
+    assert expand_semantic_features(pack_semantic_features(features)) == features
 
 
 def test_categorical_targets_are_normalized() -> None:

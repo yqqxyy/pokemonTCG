@@ -20,7 +20,7 @@ from poketcg.engine import OfficialEngine
 from poketcg.match import play_match
 
 from .data import BCExample, collate_bc
-from .features import FeatureEncoder, FeatureEncoderV2
+from .features import build_feature_encoder
 from .model import build_model, encoder_version
 from .train_bc import resolve_device
 
@@ -307,12 +307,11 @@ class DiagnosticPolicyAgent:
         self._model = build_model(saved["model_config"]).to(device)
         self._model.load_state_dict(saved["model_state_dict"])
         self._model.eval()
-        encoder_class = (
-            FeatureEncoderV2
-            if encoder_version(saved["model_config"]) == 2
-            else FeatureEncoder
+        self._encoder = build_feature_encoder(
+            encoder_version(saved["model_config"]),
+            card_catalog,
+            attack_catalog,
         )
-        self._encoder = encoder_class(card_catalog, attack_catalog)
         self._fallback = RuleAgent(
             card_catalog=card_catalog,
             attack_catalog=attack_catalog,

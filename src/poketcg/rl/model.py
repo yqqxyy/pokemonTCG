@@ -5,7 +5,13 @@ from __future__ import annotations
 import torch
 from torch import Tensor, nn
 
-from .features import OPTION_FEATURE_SIZE, STATE_FEATURE_SIZE, TOKEN_FEATURE_SIZE
+from .features import (
+    HISTORY_FEATURE_SIZE,
+    OPTION_FEATURE_SIZE,
+    SEMANTIC_FEATURE_SIZE,
+    STATE_FEATURE_SIZE,
+    TOKEN_FEATURE_SIZE,
+)
 
 
 class CandidatePolicyValueNet(nn.Module):
@@ -99,6 +105,8 @@ class TokenPolicyValueNet(nn.Module):
         dropout: float = 0.1,
         card_vocab_size: int = 2048,
         attack_vocab_size: int = 2048,
+        semantic_feature_size: int = 0,
+        history_feature_size: int = 0,
     ) -> None:
         super().__init__()
         if hidden_size % num_heads != 0:
@@ -107,6 +115,12 @@ class TokenPolicyValueNet(nn.Module):
         self.value_bins = value_bins
         self.card_vocab_size = card_vocab_size
         self.attack_vocab_size = attack_vocab_size
+        self.semantic_feature_size = semantic_feature_size
+        self.history_feature_size = history_feature_size
+        if semantic_feature_size not in {0, SEMANTIC_FEATURE_SIZE}:
+            raise ValueError("semantic_feature_size does not match the V3 schema")
+        if history_feature_size not in {0, HISTORY_FEATURE_SIZE}:
+            raise ValueError("history_feature_size does not match the V3 schema")
 
         self.select_embedding = nn.Embedding(16, hidden_size)
         self.context_embedding = nn.Embedding(64, hidden_size)
@@ -121,6 +135,24 @@ class TokenPolicyValueNet(nn.Module):
         self.option_type_embedding = nn.Embedding(32, hidden_size)
         self.area_embedding = nn.Embedding(16, hidden_size)
         self.special_condition_embedding = nn.Embedding(16, hidden_size)
+        if semantic_feature_size:
+            self.token_semantic_projection: nn.Linear | None = nn.Linear(
+                semantic_feature_size, hidden_size
+            )
+            self.option_semantic_projection: nn.Linear | None = nn.Linear(
+                semantic_feature_size, hidden_size
+            )
+        else:
+            self.token_semantic_projection = None
+            self.option_semantic_projection = None
+        if history_feature_size:
+            self.history_projection: nn.Linear | None = nn.Linear(
+                history_feature_size, hidden_size
+            )
+            self.history_type_embedding: nn.Embedding | None = nn.Embedding(32, hidden_size)
+        else:
+            self.history_projection = None
+            self.history_type_embedding = None
 
         self.state_projection = nn.Linear(STATE_FEATURE_SIZE, hidden_size)
         self.token_projection = nn.Linear(TOKEN_FEATURE_SIZE, hidden_size)
@@ -189,17 +221,40 @@ class TokenPolicyValueNet(nn.Module):
             + self.energy_type_embedding(batch["token_weaknesses"].clamp(0, 15))
             + self.energy_type_embedding(batch["token_resistances"].clamp(0, 15))
         )
+        if self.token_semantic_projection is not None:
+            token_hidden = token_hidden + self.token_semantic_projection(
+                batch["token_semantics"]
+            )
         token_hidden = self.token_norm(token_hidden)
-        state_sequence = torch.cat([state_token.unsqueeze(1), token_hidden], dim=1)
-        state_mask = torch.cat(
-            [
-                torch.ones(
-                    state_token.shape[0], 1, dtype=torch.bool, device=state_token.device
-                ),
-                batch["token_mask"],
-            ],
-            dim=1,
-        )
+        sequence_parts = [state_token.unsqueeze(1), token_hidden]
+        mask_parts = [
+            torch.ones(state_token.shape[0], 1, dtype=torch.bool, device=state_token.device),
+            batch["token_mask"],
+        ]
+        if self.history_projection is not None and self.history_type_embedding is not None:
+            history_card_ids = self._embedding_ids(
+                batch["history_card_ids"], self.card_vocab_size
+            )
+            history_target_card_ids = self._embedding_ids(
+                batch["history_target_card_ids"], self.card_vocab_size
+            )
+            history_attack_ids = self._embedding_ids(
+                batch["history_attack_ids"], self.attack_vocab_size
+            )
+            history_hidden = (
+                self.history_projection(batch["history_features"])
+                + self.history_type_embedding(batch["history_types"].clamp(0, 31))
+                + self.owner_embedding(batch["history_owners"].clamp(0, 2))
+                + self.card_embedding(history_card_ids)
+                + self.card_embedding(history_target_card_ids)
+                + self.attack_embedding(history_attack_ids)
+                + self.zone_embedding(batch["history_from_zones"].clamp(0, 15))
+                + self.zone_embedding(batch["history_to_zones"].clamp(0, 15))
+            )
+            sequence_parts.append(self.token_norm(history_hidden))
+            mask_parts.append(batch["history_mask"])
+        state_sequence = torch.cat(sequence_parts, dim=1)
+        state_mask = torch.cat(mask_parts, dim=1)
         encoded_state = self.state_transformer(
             state_sequence,
             src_key_padding_mask=~state_mask,
@@ -221,6 +276,10 @@ class TokenPolicyValueNet(nn.Module):
                 batch["option_special_conditions"].clamp(0, 15)
             )
         )
+        if self.option_semantic_projection is not None:
+            option_hidden = option_hidden + self.option_semantic_projection(
+                batch["option_semantics"]
+            )
         option_hidden = self.option_norm(option_hidden)
         attended_options, _ = self.option_attention(
             option_hidden,
@@ -259,11 +318,22 @@ def build_model(config: dict) -> PolicyValueModel:
         return CandidatePolicyValueNet(**values)
     if model_type == "transformer_v2":
         return TokenPolicyValueNet(**values)
+    if model_type == "transformer_v3":
+        use_card_semantics = bool(values.pop("use_card_semantics", True))
+        use_history = bool(values.pop("use_history", True))
+        values.setdefault(
+            "semantic_feature_size", SEMANTIC_FEATURE_SIZE if use_card_semantics else 0
+        )
+        values.setdefault("history_feature_size", HISTORY_FEATURE_SIZE if use_history else 0)
+        return TokenPolicyValueNet(**values)
     raise ValueError(f"Unsupported model_type: {model_type}")
 
 
 def encoder_version(config: dict) -> int:
-    return 2 if config.get("model_type") == "transformer_v2" else 1
+    return {
+        "transformer_v2": 2,
+        "transformer_v3": 3,
+    }.get(config.get("model_type"), 1)
 
 
 def categorical_value_targets(

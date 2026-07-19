@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from typing import Any
@@ -9,7 +10,84 @@ from typing import Any
 STATE_FEATURE_SIZE = 30
 OPTION_FEATURE_SIZE = 20
 TOKEN_FEATURE_SIZE = 24
+SEMANTIC_FEATURE_SIZE = 40
+PACKED_SEMANTIC_FEATURE_SIZE = 9
+HISTORY_FEATURE_SIZE = 5
 MAX_STATE_TOKENS = 192
+MAX_HISTORY_TOKENS = 32
+
+SEMANTIC_TAGS = (
+    "draw",
+    "search_deck",
+    "shuffle",
+    "discard",
+    "mill_deck",
+    "recover_discard",
+    "attach_energy",
+    "move_energy",
+    "energy_from_deck_or_discard",
+    "heal",
+    "damage_scaling",
+    "damage_reduction_or_prevention",
+    "bench_damage",
+    "self_damage",
+    "switch",
+    "retreat",
+    "special_condition",
+    "coin_flip",
+    "knock_out",
+    "prize",
+    "hand_disruption",
+    "deck_manipulation",
+    "evolve",
+    "put_into_hand",
+    "conditional",
+    "once_per_turn",
+    "active_target",
+    "bench_target",
+    "opponent_target",
+    "own_target",
+    "reveal",
+    "look_at",
+)
+
+_SEMANTIC_PATTERNS = (
+    r"\bdraw\b",
+    r"search your deck|search (?:his or her|their) deck",
+    r"\bshuffle\b",
+    r"\bdiscard\b",
+    r"discard the top .+ cards? of .+ deck|discard .+ from the top of .+ deck",
+    r"from (?:your|their) discard pile|discard pile.+(?:hand|deck)",
+    r"attach .+ energy",
+    r"move .+ energy",
+    r"attach .+ energy .+(?:deck|discard pile)|energy .+ from .+(?:deck|discard pile)",
+    r"\bheal\b|remove .+ damage counter",
+    r"damage for each|more damage|less damage|damage instead|additional damage",
+    r"takes? .+ less damage|prevent all damage|isn.t affected by|no damage",
+    r"benched pok[eé]mon|to the bench",
+    r"damage to this pok[eé]mon|does .+ damage to itself",
+    r"\bswitch\b",
+    r"\bretreat\b",
+    r"poison|burn|asleep|paraly[sz]|confus",
+    r"flip .+ coin|coin flip",
+    r"knock out",
+    r"prize card",
+    r"shuffle your hand|discard .+ hand|opponent.+hand",
+    r"top .+ cards? of .+ deck|put .+ (?:top|bottom) of .+ deck",
+    r"\bevolve\b|evolution pok[eé]mon",
+    r"return .+ to .+ hand|put .+ into .+ hand",
+    r"\bif\b|for each|during .+ turn|when(?:ever)?|unless|up to",
+    r"once during your turn|once per turn",
+    r"active pok[eé]mon",
+    r"benched pok[eé]mon|\bbench\b",
+    r"opponent(?:.s|s')|your opponent",
+    r"your pok[eé]mon|this pok[eé]mon|yourself",
+    r"\breveal\b",
+    r"look at",
+)
+
+if len(SEMANTIC_TAGS) + 8 != SEMANTIC_FEATURE_SIZE:
+    raise AssertionError("Semantic feature schema size is inconsistent")
 
 
 def _value(record: Any, field: str, default: Any = None) -> Any:
@@ -49,6 +127,16 @@ class EncodedDecision:
     option_card_ids: list[int] | None = None
     option_attack_ids: list[int] | None = None
     option_special_conditions: list[int] | None = None
+    token_semantics: list[list[float]] | None = None
+    option_semantics: list[list[float]] | None = None
+    history_features: list[list[float]] | None = None
+    history_types: list[int] | None = None
+    history_owners: list[int] | None = None
+    history_card_ids: list[int] | None = None
+    history_target_card_ids: list[int] | None = None
+    history_attack_ids: list[int] | None = None
+    history_from_zones: list[int] | None = None
+    history_to_zones: list[int] | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -382,3 +470,178 @@ class FeatureEncoderV2(FeatureEncoder):
             min(len(evolutions) / 3.0, 1.0),
             *(float(value) for value in statuses),
         ]
+
+
+def _semantic_text_features(text: str) -> list[float]:
+    normalized = text.lower().replace("’", "'").replace("é", "e")
+    return [float(bool(re.search(pattern, normalized))) for pattern in _SEMANTIC_PATTERNS]
+
+
+def _merge_semantics(first: list[float], second: list[float]) -> list[float]:
+    return [max(left, right) for left, right in zip(first, second, strict=True)]
+
+
+def pack_semantic_features(features: list[float]) -> list[float]:
+    """Pack 32 binary tags into one bitmask while retaining eight numeric values."""
+    if len(features) != SEMANTIC_FEATURE_SIZE:
+        raise ValueError(f"Expected {SEMANTIC_FEATURE_SIZE} semantic features")
+    mask = sum(
+        (1 << index) for index, value in enumerate(features[: len(SEMANTIC_TAGS)]) if value
+    )
+    return [mask, *features[len(SEMANTIC_TAGS) :]]
+
+
+def expand_semantic_features(features: list[float]) -> list[float]:
+    """Expand either the compact JSON representation or an already-dense vector."""
+    if len(features) == SEMANTIC_FEATURE_SIZE:
+        return features
+    if len(features) != PACKED_SEMANTIC_FEATURE_SIZE:
+        raise ValueError("Semantic features must use the packed or dense V3 schema")
+    mask = int(features[0])
+    tags = [float(bool(mask & (1 << index))) for index in range(len(SEMANTIC_TAGS))]
+    return [*tags, *(float(value) for value in features[1:])]
+
+
+def structured_semantic_features(
+    card: Any | None,
+    attacks: list[Any] | tuple[Any, ...] = (),
+) -> list[float]:
+    """Convert official effect text and printed values into a stable semantic schema."""
+    skills = list(_value(card, "skills", []) or [])
+    attacks = list(attacks)
+    texts = [str(_value(item, "text", "") or "") for item in [*skills, *attacks]]
+    combined_text = " ".join(text for text in texts if text)
+    tags = _semantic_text_features(combined_text)
+    printed_damage = [float(_value(attack, "damage", 0) or 0) for attack in attacks]
+    energy_costs = [len(_value(attack, "energies", []) or []) for attack in attacks]
+    numeric_values = [float(value) for value in re.findall(r"\b\d+\b", combined_text)]
+    numeric = [
+        float(bool(combined_text)),
+        min(max(printed_damage, default=0.0) / 400.0, 1.0),
+        min(max(numeric_values, default=0.0) / 400.0, 1.0),
+        min(min(energy_costs, default=0) / 5.0, 1.0),
+        min(max(energy_costs, default=0) / 5.0, 1.0),
+        min(len(attacks) / 4.0, 1.0),
+        min(len(skills) / 4.0, 1.0),
+        min(len(combined_text) / 500.0, 1.0),
+    ]
+    features = [*tags, *numeric]
+    if len(features) != SEMANTIC_FEATURE_SIZE:
+        raise AssertionError(f"Expected {SEMANTIC_FEATURE_SIZE} semantic features")
+    return features
+
+
+class FeatureEncoderV3(FeatureEncoderV2):
+    """Add structured effect semantics and recent visible engine events to V2 tokens."""
+
+    version = 3
+
+    def __init__(
+        self,
+        card_catalog: Mapping[int, Any],
+        attack_catalog: Mapping[int, Any],
+    ) -> None:
+        super().__init__(card_catalog, attack_catalog)
+        self._card_semantics = {
+            int(card_id): structured_semantic_features(
+                card,
+                [
+                    attack_catalog[attack_id]
+                    for attack_id in (_value(card, "attacks", []) or [])
+                    if attack_id in attack_catalog
+                ],
+            )
+            for card_id, card in card_catalog.items()
+        }
+        self._card_skill_semantics = {
+            int(card_id): structured_semantic_features(card)
+            for card_id, card in card_catalog.items()
+        }
+        self._attack_semantics = {
+            int(attack_id): structured_semantic_features(None, [attack])
+            for attack_id, attack in attack_catalog.items()
+        }
+        self._empty_semantics = [0.0] * SEMANTIC_FEATURE_SIZE
+
+    def encode(self, observation: dict) -> EncodedDecision:
+        decision = super().encode(observation)
+        state = observation["current"]
+        your_index = int(state["yourIndex"])
+        decision.version = self.version
+        decision.token_semantics = [
+            pack_semantic_features(
+                self._card_semantics.get(card_id, self._empty_semantics)
+            )
+            for card_id in decision.token_card_ids or []
+        ]
+        decision.option_semantics = []
+        for card_id, attack_id in zip(
+            decision.option_card_ids or [],
+            decision.option_attack_ids or [],
+            strict=True,
+        ):
+            attack_semantics = self._attack_semantics.get(attack_id, self._empty_semantics)
+            card_semantics = (
+                self._card_skill_semantics.get(card_id, self._empty_semantics)
+                if attack_id
+                else self._card_semantics.get(card_id, self._empty_semantics)
+            )
+            decision.option_semantics.append(
+                pack_semantic_features(_merge_semantics(card_semantics, attack_semantics))
+            )
+
+        history = list(observation.get("logs") or [])[-MAX_HISTORY_TOKENS:]
+        history_count = len(history)
+        decision.history_features = []
+        decision.history_types = []
+        decision.history_owners = []
+        decision.history_card_ids = []
+        decision.history_target_card_ids = []
+        decision.history_attack_ids = []
+        decision.history_from_zones = []
+        decision.history_to_zones = []
+        for index, event in enumerate(history):
+            player_index = _value(event, "playerIndex")
+            owner = (
+                0
+                if player_index is None
+                else (1 if int(player_index) == your_index else 2)
+            )
+            has_basic = _value(event, "hasBasicPokemon")
+            value = float(_value(event, "value", 0) or 0)
+            decision.history_features.append(
+                [
+                    max(-1.0, min(value / 400.0, 1.0)),
+                    float(bool(_value(event, "putDamageCounter", False))),
+                    float(has_basic is not None),
+                    float(bool(has_basic)),
+                    (index + 1) / max(history_count, 1),
+                ]
+            )
+            decision.history_types.append(int(_value(event, "type", 0) or 0))
+            decision.history_owners.append(owner)
+            decision.history_card_ids.append(int(_value(event, "cardId", 0) or 0))
+            decision.history_target_card_ids.append(
+                int(_value(event, "cardIdTarget", 0) or 0)
+            )
+            decision.history_attack_ids.append(int(_value(event, "attackId", 0) or 0))
+            decision.history_from_zones.append(int(_value(event, "fromArea", 0) or 0))
+            decision.history_to_zones.append(int(_value(event, "toArea", 0) or 0))
+        return decision
+
+
+def build_feature_encoder(
+    version: int,
+    card_catalog: Mapping[int, Any],
+    attack_catalog: Mapping[int, Any],
+) -> FeatureEncoder:
+    encoder_types = {
+        1: FeatureEncoder,
+        2: FeatureEncoderV2,
+        3: FeatureEncoderV3,
+    }
+    try:
+        encoder_type = encoder_types[version]
+    except KeyError as error:
+        raise ValueError(f"Unsupported encoder version: {version}") from error
+    return encoder_type(card_catalog, attack_catalog)

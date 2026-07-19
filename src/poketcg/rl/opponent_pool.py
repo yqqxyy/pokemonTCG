@@ -12,7 +12,7 @@ import torch
 from poketcg.agents import Agent, RandomAgent, RuleAgent
 
 from .data import BCExample, collate_bc
-from .features import FeatureEncoder, FeatureEncoderV2
+from .features import FeatureEncoder, build_feature_encoder
 from .model import PolicyValueModel, build_model, encoder_version
 
 
@@ -113,8 +113,8 @@ class OpponentPool:
         self._cards = card_catalog
         self._attacks = attack_catalog
         self._encoders = {
-            1: FeatureEncoder(card_catalog, attack_catalog),
-            2: FeatureEncoderV2(card_catalog, attack_catalog),
+            version: build_feature_encoder(version, card_catalog, attack_catalog)
+            for version in (1, 2, 3)
         }
         self._rng = random.Random(seed)
         self._entries: list[_PoolEntry] = []

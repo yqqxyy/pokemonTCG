@@ -10,7 +10,14 @@ import torch
 from torch import Tensor
 from torch.utils.data import Dataset
 
-from .features import OPTION_FEATURE_SIZE, TOKEN_FEATURE_SIZE, EncodedDecision
+from .features import (
+    HISTORY_FEATURE_SIZE,
+    OPTION_FEATURE_SIZE,
+    SEMANTIC_FEATURE_SIZE,
+    TOKEN_FEATURE_SIZE,
+    EncodedDecision,
+    expand_semantic_features,
+)
 
 
 @dataclass(slots=True)
@@ -71,7 +78,7 @@ def write_jsonl(path: str | Path, examples: list[BCExample]) -> None:
 def collate_bc(examples: list[BCExample]) -> dict[str, Tensor]:
     versions = {example.decision.version for example in examples}
     if len(versions) != 1:
-        raise ValueError("A batch cannot mix V1 and V2 encoded decisions")
+        raise ValueError("A batch cannot mix encoded decision versions")
     version = versions.pop()
     batch_size = len(examples)
     max_options = max(len(example.decision.options) for example in examples)
@@ -114,7 +121,7 @@ def collate_bc(examples: list[BCExample]) -> dict[str, Tensor]:
     }
     if version == 1:
         return batch
-    if version != 2:
+    if version not in {2, 3}:
         raise ValueError(f"Unsupported encoded decision version: {version}")
 
     token_counts = [len(example.decision.tokens or []) for example in examples]
@@ -145,7 +152,7 @@ def collate_bc(examples: list[BCExample]) -> dict[str, Tensor]:
         for name, tensor in token_fields.items():
             values = getattr(decision, name)
             if values is None or len(values) != count:
-                raise ValueError(f"{name} must match the V2 token count")
+                raise ValueError(f"{name} must match the token count")
             tensor[row, :count] = torch.tensor(values, dtype=torch.long)
         option_count = len(decision.options)
         for name, tensor in (
@@ -155,7 +162,7 @@ def collate_bc(examples: list[BCExample]) -> dict[str, Tensor]:
         ):
             values = getattr(decision, name)
             if values is None or len(values) != option_count:
-                raise ValueError(f"{name} must match the V2 option count")
+                raise ValueError(f"{name} must match the option count")
             tensor[row, :option_count] = torch.tensor(values, dtype=torch.long)
 
     batch.update(token_fields)
@@ -166,6 +173,68 @@ def collate_bc(examples: list[BCExample]) -> dict[str, Tensor]:
             "option_card_ids": option_card_ids,
             "option_attack_ids": option_attack_ids,
             "option_special_conditions": option_special_conditions,
+        }
+    )
+    if version == 2:
+        return batch
+
+    token_semantics = torch.zeros(
+        batch_size, max_tokens, SEMANTIC_FEATURE_SIZE, dtype=torch.float32
+    )
+    option_semantics = torch.zeros(
+        batch_size, max_options, SEMANTIC_FEATURE_SIZE, dtype=torch.float32
+    )
+    history_counts = [len(example.decision.history_features or []) for example in examples]
+    max_history = max(1, max(history_counts))
+    history_features = torch.zeros(
+        batch_size, max_history, HISTORY_FEATURE_SIZE, dtype=torch.float32
+    )
+    history_mask = torch.zeros(batch_size, max_history, dtype=torch.bool)
+    history_fields = {
+        "history_types": torch.zeros(batch_size, max_history, dtype=torch.long),
+        "history_owners": torch.zeros(batch_size, max_history, dtype=torch.long),
+        "history_card_ids": torch.zeros(batch_size, max_history, dtype=torch.long),
+        "history_target_card_ids": torch.zeros(batch_size, max_history, dtype=torch.long),
+        "history_attack_ids": torch.zeros(batch_size, max_history, dtype=torch.long),
+        "history_from_zones": torch.zeros(batch_size, max_history, dtype=torch.long),
+        "history_to_zones": torch.zeros(batch_size, max_history, dtype=torch.long),
+    }
+    for row, example in enumerate(examples):
+        decision = example.decision
+        token_count = token_counts[row]
+        option_count = len(decision.options)
+        history_count = history_counts[row]
+        if decision.token_semantics is None or len(decision.token_semantics) != token_count:
+            raise ValueError("token_semantics must match the V3 token count")
+        if decision.option_semantics is None or len(decision.option_semantics) != option_count:
+            raise ValueError("option_semantics must match the V3 option count")
+        if token_count:
+            token_semantics[row, :token_count] = torch.tensor(
+                [expand_semantic_features(item) for item in decision.token_semantics],
+                dtype=torch.float32,
+            )
+        option_semantics[row, :option_count] = torch.tensor(
+            [expand_semantic_features(item) for item in decision.option_semantics],
+            dtype=torch.float32,
+        )
+        if history_count:
+            history_features[row, :history_count] = torch.tensor(
+                decision.history_features, dtype=torch.float32
+            )
+        history_mask[row, :history_count] = True
+        for name, tensor in history_fields.items():
+            values = getattr(decision, name)
+            if values is None or len(values) != history_count:
+                raise ValueError(f"{name} must match the V3 history count")
+            tensor[row, :history_count] = torch.tensor(values, dtype=torch.long)
+
+    batch.update(history_fields)
+    batch.update(
+        {
+            "token_semantics": token_semantics,
+            "option_semantics": option_semantics,
+            "history_features": history_features,
+            "history_mask": history_mask,
         }
     )
     return batch

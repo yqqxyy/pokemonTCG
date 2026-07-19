@@ -8,7 +8,7 @@ from pathlib import Path
 import torch
 
 from poketcg.rl.data import BCExample, collate_bc
-from poketcg.rl.features import FeatureEncoder, FeatureEncoderV2
+from poketcg.rl.features import build_feature_encoder
 from poketcg.rl.model import build_model, encoder_version
 
 from .rule_agent import RuleAgent
@@ -37,12 +37,11 @@ class BCPolicyAgent:
         self._model.eval()
         self._deterministic = deterministic
         self._rng = random.Random(seed)
-        encoder_class = (
-            FeatureEncoderV2
-            if encoder_version(saved["model_config"]) == 2
-            else FeatureEncoder
+        self._encoder = build_feature_encoder(
+            encoder_version(saved["model_config"]),
+            card_catalog,
+            attack_catalog,
         )
-        self._encoder = encoder_class(card_catalog, attack_catalog)
         self._fallback = RuleAgent(
             card_catalog=card_catalog,
             attack_catalog=attack_catalog,

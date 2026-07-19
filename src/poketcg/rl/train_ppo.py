@@ -23,7 +23,7 @@ from poketcg.agents import RandomAgent, RuleAgent
 from poketcg.engine import OfficialEngine
 
 from .data import BCExample, collate_bc
-from .features import EncodedDecision, FeatureEncoder, FeatureEncoderV2
+from .features import EncodedDecision, FeatureEncoder, build_feature_encoder
 from .model import (
     PolicyValueModel,
     build_model,
@@ -345,8 +345,8 @@ def _initialize_rollout_worker(
     card_catalog = engine.card_catalog()
     attack_catalog = engine.attack_catalog()
     encoders: dict[int, FeatureEncoder] = {
-        1: FeatureEncoder(card_catalog, attack_catalog),
-        2: FeatureEncoderV2(card_catalog, attack_catalog),
+        version: build_feature_encoder(version, card_catalog, attack_catalog)
+        for version in (1, 2, 3)
     }
     global _ROLLOUT_WORKER_CONTEXT
     _ROLLOUT_WORKER_CONTEXT = _RolloutWorkerContext(
@@ -994,12 +994,11 @@ def main(argv: list[str] | None = None) -> int:
     deck = engine.load_deck(args.deck or engine.sample_deck_path)
     card_catalog = engine.card_catalog()
     attack_catalog = engine.attack_catalog()
-    encoder_class = (
-        FeatureEncoderV2
-        if encoder_version(saved["model_config"]) == 2
-        else FeatureEncoder
+    encoder = build_feature_encoder(
+        encoder_version(saved["model_config"]),
+        card_catalog,
+        attack_catalog,
     )
-    encoder = encoder_class(card_catalog, attack_catalog)
     opponent_pool = build_opponent_pool(
         args,
         card_catalog=card_catalog,

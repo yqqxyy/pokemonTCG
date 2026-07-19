@@ -28,7 +28,7 @@ class EpochMetrics:
 
 
 class TokenBucketBatchSampler(Sampler[list[int]]):
-    """Group similarly sized V2 token sequences to reduce attention padding."""
+    """Group similarly sized token sequences to reduce attention padding."""
 
     def __init__(
         self,
@@ -140,12 +140,27 @@ def train(args: argparse.Namespace) -> tuple[PolicyValueModel, list[EpochMetrics
     if len(data_versions) != 1:
         raise ValueError("Training data cannot mix encoder versions")
     data_version = data_versions.pop()
-    inferred_model_type = "transformer_v2" if data_version == 2 else "mlp_v1"
+    inferred_model_type = {
+        1: "mlp_v1",
+        2: "transformer_v2",
+        3: "transformer_v3",
+    }.get(data_version)
+    if inferred_model_type is None:
+        raise ValueError(f"Unsupported encoder version: {data_version}")
     model_type = inferred_model_type if args.model_type == "auto" else args.model_type
-    if (model_type == "transformer_v2") != (data_version == 2):
+    expected_model_type = {
+        1: "mlp_v1",
+        2: "transformer_v2",
+        3: "transformer_v3",
+    }[data_version]
+    if model_type != expected_model_type:
         raise ValueError(f"{model_type} is incompatible with encoder V{data_version} data")
+    if model_type != "transformer_v3" and (
+        args.disable_card_semantics or args.disable_history
+    ):
+        raise ValueError("V3 ablation flags require encoder V3 training data")
     train_data, validation_data = split_by_game(dataset, args.validation_fraction, args.seed)
-    if data_version == 2:
+    if data_version in {2, 3}:
         train_loader = DataLoader(
             train_data,
             batch_sampler=TokenBucketBatchSampler(
@@ -179,7 +194,7 @@ def train(args: argparse.Namespace) -> tuple[PolicyValueModel, list[EpochMetrics
         "hidden_size": args.hidden_size,
         "value_bins": args.value_bins,
     }
-    if model_type == "transformer_v2":
+    if model_type in {"transformer_v2", "transformer_v3"}:
         model_config.update(
             {
                 "num_layers": args.num_layers,
@@ -187,6 +202,13 @@ def train(args: argparse.Namespace) -> tuple[PolicyValueModel, list[EpochMetrics
                 "dropout": args.dropout,
                 "card_vocab_size": args.card_vocab_size,
                 "attack_vocab_size": args.attack_vocab_size,
+            }
+        )
+    if model_type == "transformer_v3":
+        model_config.update(
+            {
+                "use_card_semantics": not args.disable_card_semantics,
+                "use_history": not args.disable_history,
             }
         )
     model = build_model(model_config).to(device)
@@ -268,7 +290,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--value-bins", type=int, default=101)
     parser.add_argument(
         "--model-type",
-        choices=("auto", "mlp_v1", "transformer_v2"),
+        choices=("auto", "mlp_v1", "transformer_v2", "transformer_v3"),
         default="auto",
     )
     parser.add_argument("--num-layers", type=int, default=3)
@@ -276,6 +298,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--card-vocab-size", type=int, default=2048)
     parser.add_argument("--attack-vocab-size", type=int, default=2048)
+    parser.add_argument("--disable-card-semantics", action="store_true")
+    parser.add_argument("--disable-history", action="store_true")
     parser.add_argument("--value-coefficient", type=float, default=0.25)
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
     parser.add_argument("--validation-fraction", type=float, default=0.1)
