@@ -27,7 +27,7 @@ def _record(
         context=0,
         context_name="UNKNOWN",
         option_count=2,
-        chosen_action=0,
+        chosen_action=[0],
         action_probability=0.8,
         policy_entropy=0.5,
         predicted_return=predicted_return,

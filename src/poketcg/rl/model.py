@@ -314,6 +314,7 @@ def build_model(config: dict) -> PolicyValueModel:
     """Build old and new checkpoints through one backward-compatible factory."""
     values = dict(config)
     model_type = values.pop("model_type", "mlp_v1")
+    values.pop("action_space_version", None)
     if model_type == "mlp_v1":
         return CandidatePolicyValueNet(**values)
     if model_type == "transformer_v2":
@@ -334,6 +335,10 @@ def encoder_version(config: dict) -> int:
         "transformer_v2": 2,
         "transformer_v3": 3,
     }.get(config.get("model_type"), 1)
+
+
+def action_space_version(config: dict) -> int:
+    return int(config.get("action_space_version", 1))
 
 
 def categorical_value_targets(

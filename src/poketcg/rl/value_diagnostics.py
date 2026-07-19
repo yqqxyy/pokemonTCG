@@ -12,16 +12,22 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from torch.distributions import Categorical
 
 from poketcg.agents import RandomAgent, RuleAgent
 from poketcg.agents.rule_agent import SelectContext
 from poketcg.engine import OfficialEngine
 from poketcg.match import play_match
 
+from .action_space import (
+    batch_subset_entropies,
+    deterministic_subset,
+    neural_selection,
+    sample_subset,
+    subset_log_probability,
+)
 from .data import BCExample, collate_bc
 from .features import build_feature_encoder
-from .model import build_model, encoder_version
+from .model import action_space_version, build_model, encoder_version
 from .train_bc import resolve_device
 
 
@@ -35,7 +41,7 @@ class ValueRecord:
     context: int
     context_name: str
     option_count: int
-    chosen_action: int
+    chosen_action: list[int]
     action_probability: float
     policy_entropy: float
     predicted_return: float
@@ -307,6 +313,7 @@ class DiagnosticPolicyAgent:
         self._model = build_model(saved["model_config"]).to(device)
         self._model.load_state_dict(saved["model_state_dict"])
         self._model.eval()
+        self._action_space_version = action_space_version(saved["model_config"])
         self._encoder = build_feature_encoder(
             encoder_version(saved["model_config"]),
             card_catalog,
@@ -338,32 +345,48 @@ class DiagnosticPolicyAgent:
         selection = observation.get("select")
         if selection is None:
             raise ValueError("DiagnosticPolicyAgent received a deck-selection observation")
-        learnable = (
-            len(selection["option"]) > 1
-            and int(selection["minCount"]) == 1
-            and int(selection["maxCount"]) == 1
-        )
-        if not learnable:
+        if not neural_selection(selection, self._action_space_version):
             return self._fallback.choose_action(observation)
 
         state = observation["current"]
         player = int(state["yourIndex"])
         decision = self._encoder.encode(observation)
-        example = BCExample(decision, action=0, value_target=0.0, player=player, game=self._game)
+        example = BCExample(
+            decision,
+            action=list(range(decision.minimum)),
+            value_target=0.0,
+            player=player,
+            game=self._game,
+        )
         batch = {
             key: value.to(self._device) for key, value in collate_bc([example]).items()
         }
         with torch.no_grad():
             policy_logits, value_logits = self._model(batch)
-            distribution = Categorical(logits=policy_logits)
             predicted_return = float(self._model.expected_value(value_logits).item())
-        probabilities = policy_logits.softmax(dim=-1).squeeze(0).cpu().tolist()
+            entropy = batch_subset_entropies(
+                policy_logits,
+                batch["option_mask"],
+                batch["minimum"],
+                batch["maximum"],
+            )
+        valid_logits = policy_logits.squeeze(0)
         if self._deterministic:
-            chosen_action = max(range(len(probabilities)), key=probabilities.__getitem__)
+            chosen_action = deterministic_subset(
+                valid_logits, decision.minimum, decision.maximum
+            )
         else:
-            chosen_action = self._rng.choices(
-                range(len(probabilities)), weights=probabilities, k=1
-            )[0]
+            chosen_action = sample_subset(
+                valid_logits,
+                decision.minimum,
+                decision.maximum,
+                rng=self._rng,
+            )
+        selected = torch.zeros_like(valid_logits, dtype=torch.bool)
+        selected[chosen_action] = True
+        log_probability = subset_log_probability(
+            valid_logits, selected, decision.minimum, decision.maximum
+        )
         own_prizes = len(state["players"][player]["prize"])
         opponent_prizes = len(state["players"][1 - player]["prize"])
         self.records.append(
@@ -377,8 +400,8 @@ class DiagnosticPolicyAgent:
                 context_name=_context_name(int(selection["context"])),
                 option_count=len(selection["option"]),
                 chosen_action=chosen_action,
-                action_probability=round(probabilities[chosen_action], 6),
-                policy_entropy=round(float(distribution.entropy().item()), 6),
+                action_probability=round(float(log_probability.exp()), 6),
+                policy_entropy=round(float(entropy.item()), 6),
                 predicted_return=round(predicted_return, 6),
                 outcome=0.0,
                 own_prizes_remaining=own_prizes,
@@ -387,7 +410,7 @@ class DiagnosticPolicyAgent:
             )
         )
         self._decision += 1
-        return [chosen_action]
+        return chosen_action
 
 
 def _baseline_agent(

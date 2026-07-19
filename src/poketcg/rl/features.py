@@ -137,6 +137,8 @@ class EncodedDecision:
     history_attack_ids: list[int] | None = None
     history_from_zones: list[int] | None = None
     history_to_zones: list[int] | None = None
+    minimum: int = 1
+    maximum: int = 1
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -172,6 +174,8 @@ class FeatureEncoder:
             option_types=[int(option["type"]) for option in options],
             areas=[int(option.get("area") or 0) for option in options],
             in_play_areas=[int(option.get("inPlayArea") or 0) for option in options],
+            minimum=int(selection["minCount"]),
+            maximum=int(selection["maxCount"]),
         )
 
     def _state_features(self, state: dict, selection: dict) -> list[float]:

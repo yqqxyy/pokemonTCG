@@ -17,15 +17,22 @@ from typing import Any
 
 import torch
 from torch import nn
-from torch.distributions import Categorical
 
 from poketcg.agents import RandomAgent, RuleAgent
 from poketcg.engine import OfficialEngine
 
+from .action_space import (
+    batch_subset_entropies,
+    batch_subset_log_probabilities,
+    neural_selection,
+    sample_subset,
+    subset_log_probability,
+)
 from .data import BCExample, collate_bc
 from .features import EncodedDecision, FeatureEncoder, build_feature_encoder
 from .model import (
     PolicyValueModel,
+    action_space_version,
     build_model,
     categorical_value_targets,
     encoder_version,
@@ -37,7 +44,7 @@ from .train_bc import resolve_device
 @dataclass(slots=True)
 class PPOTransition:
     decision: EncodedDecision
-    action: int
+    action: int | list[int]
     old_log_probability: float
     old_value: float
     potential: float = 0.0
@@ -108,6 +115,7 @@ class _RolloutWorkerContext:
     engine: OfficialEngine
     deck: list[int]
     model: PolicyValueModel
+    model_action_space_version: int
     encoder: FeatureEncoder
     encoders: dict[int, FeatureEncoder]
     card_catalog: dict[int, object]
@@ -275,16 +283,18 @@ def explained_variance(values: list[float], targets: list[float]) -> float:
     return float(1.0 - residual_variance / target_variance)
 
 
-def _learnable(selection: dict) -> bool:
-    return (
-        len(selection["option"]) > 1
-        and int(selection["minCount"]) == 1
-        and int(selection["maxCount"]) == 1
-    )
+def _learnable(selection: dict, action_version: int) -> bool:
+    return neural_selection(selection, action_version)
 
 
 def _single_batch(decision: EncodedDecision, device: torch.device) -> dict[str, torch.Tensor]:
-    example = BCExample(decision, action=0, value_target=0.0, player=0, game=0)
+    example = BCExample(
+        decision,
+        action=list(range(decision.minimum)),
+        value_target=0.0,
+        player=0,
+        game=0,
+    )
     return {key: value.to(device) for key, value in collate_bc([example]).items()}
 
 
@@ -353,6 +363,7 @@ def _initialize_rollout_worker(
         engine=engine,
         deck=deck,
         model=build_model(model_config).cpu().eval(),
+        model_action_space_version=action_space_version(model_config),
         encoder=encoders[model_encoder_version],
         encoders=encoders,
         card_catalog=card_catalog,
@@ -407,6 +418,7 @@ def _worker_opponent(
         card_catalog=context.card_catalog,
         attack_catalog=context.attack_catalog,
         seed=seed,
+        action_version=int(specification.get("action_space_version", 1)),
     )
 
 
@@ -448,22 +460,34 @@ def _collect_rollout_shard(task: _WorkerRolloutTask) -> list[_WorkerGameResult]:
                 player = int(observation["current"]["yourIndex"])
                 if player != learning_player:
                     action = opponent.choose_action(observation)
-                elif not _learnable(observation["select"]):
+                elif not _learnable(
+                    observation["select"], context.model_action_space_version
+                ):
                     action = resolver.choose_action(observation)
                 else:
                     decision = context.encoder.encode(observation)
                     batch = _single_batch(decision, torch.device("cpu"))
                     with torch.no_grad():
                         policy_logits, value_logits = context.model(batch)
-                        distribution = Categorical(logits=policy_logits)
-                        sampled_action = distribution.sample()
-                        log_probability = distribution.log_prob(sampled_action)
+                        valid_logits = policy_logits.squeeze(0)
+                        action = sample_subset(
+                            valid_logits,
+                            decision.minimum,
+                            decision.maximum,
+                        )
+                        selected = torch.zeros_like(valid_logits, dtype=torch.bool)
+                        selected[action] = True
+                        log_probability = subset_log_probability(
+                            valid_logits,
+                            selected,
+                            decision.minimum,
+                            decision.maximum,
+                        )
                         value = context.model.expected_value(value_logits)
-                    action = [int(sampled_action.item())]
                     episode.append(
                         PPOTransition(
                             decision=decision,
-                            action=action[0],
+                            action=action,
                             old_log_probability=float(log_probability.item()),
                             old_value=float(value.item()),
                             potential=(
@@ -560,6 +584,7 @@ def collect_rollout(
     opponent_pool: OpponentPool,
     card_catalog: dict[int, object],
     attack_catalog: dict[int, object],
+    model_action_space_version: int,
     gamma: float,
     gae_lambda: float,
     value_gae_lambda: float,
@@ -595,22 +620,32 @@ def collect_rollout(
                 player = int(observation["current"]["yourIndex"])
                 if player != learning_player:
                     action = opponent.choose_action(observation)
-                elif not _learnable(observation["select"]):
+                elif not _learnable(observation["select"], model_action_space_version):
                     action = resolver.choose_action(observation)
                 else:
                     decision = encoder.encode(observation)
                     batch = _single_batch(decision, device)
                     with torch.no_grad():
                         policy_logits, value_logits = model(batch)
-                        distribution = Categorical(logits=policy_logits)
-                        sampled_action = distribution.sample()
-                        log_probability = distribution.log_prob(sampled_action)
+                        valid_logits = policy_logits.squeeze(0)
+                        action = sample_subset(
+                            valid_logits,
+                            decision.minimum,
+                            decision.maximum,
+                        )
+                        selected = torch.zeros_like(valid_logits, dtype=torch.bool)
+                        selected[action] = True
+                        log_probability = subset_log_probability(
+                            valid_logits,
+                            selected,
+                            decision.minimum,
+                            decision.maximum,
+                        )
                         value = model.expected_value(value_logits)
-                    action = [int(sampled_action.item())]
                     episode.append(
                         PPOTransition(
                             decision=decision,
-                            action=action[0],
+                            action=action,
                             old_log_probability=float(log_probability.item()),
                             old_value=float(value.item()),
                             potential=(
@@ -778,8 +813,13 @@ def ppo_update(
         for start in range(0, len(indices), batch_size):
             batch = collate_transitions(transitions, indices[start : start + batch_size], device)
             policy_logits, value_logits = model(batch)
-            distribution = Categorical(logits=policy_logits)
-            log_probability = distribution.log_prob(batch["action"])
+            log_probability = batch_subset_log_probabilities(
+                policy_logits,
+                batch["option_mask"],
+                batch["action_mask"],
+                batch["minimum"],
+                batch["maximum"],
+            )
             log_ratio = log_probability - batch["old_log_probability"]
             ratio = log_ratio.exp()
             unclipped = ratio * batch["advantage"]
@@ -788,7 +828,12 @@ def ppo_update(
 
             targets = categorical_value_targets(batch["value_target"], model.value_support)
             value_loss = -(targets * value_logits.log_softmax(dim=-1)).sum(dim=-1).mean()
-            entropy = distribution.entropy().mean()
+            entropy = batch_subset_entropies(
+                policy_logits,
+                batch["option_mask"],
+                batch["minimum"],
+                batch["maximum"],
+            ).mean()
             loss = policy_loss + value_coefficient * value_loss - entropy_coefficient * entropy
 
             optimizer.zero_grad(set_to_none=True)
@@ -1042,6 +1087,9 @@ def main(argv: list[str] | None = None) -> int:
                     opponent_pool=opponent_pool,
                     card_catalog=card_catalog,
                     attack_catalog=attack_catalog,
+                    model_action_space_version=action_space_version(
+                        saved["model_config"]
+                    ),
                     gamma=args.gamma,
                     gae_lambda=args.gae_lambda,
                     value_gae_lambda=args.value_gae_lambda,

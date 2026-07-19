@@ -1,11 +1,20 @@
 import argparse
 import importlib
+import itertools
+import random
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from poketcg.rl.action_space import (
+    batch_subset_log_probabilities,
+    constrained_entropy,
+    constrained_log_partition,
+    deterministic_subset,
+    sample_subset,
+)
 from poketcg.rl.collect_bc import optimal_policy_target
 from poketcg.rl.data import BCExample, collate_bc
 from poketcg.rl.features import (
@@ -119,6 +128,71 @@ def test_collate_masks_variable_option_counts() -> None:
         [1.0, 0.0, 0.0, 0.0],
         [0.0, 0.0, 0.0, 1.0],
     ]
+
+
+def test_collate_supports_cardinality_constrained_set_actions() -> None:
+    example = _example(4)
+    example.decision.minimum = 1
+    example.decision.maximum = 3
+    example.action = [0, 2]
+
+    batch = collate_bc([example])
+
+    assert batch["action_mask"].tolist() == [[True, False, True, False]]
+    assert batch["minimum"].tolist() == [1]
+    assert batch["maximum"].tolist() == [3]
+    assert batch["has_soft_policy_target"].tolist() == [False]
+
+
+def _legal_subsets(option_count: int, minimum: int, maximum: int) -> list[tuple[int, ...]]:
+    return [
+        subset
+        for count in range(minimum, maximum + 1)
+        for subset in itertools.combinations(range(option_count), count)
+    ]
+
+
+def test_constrained_set_partition_and_entropy_match_brute_force() -> None:
+    logits = torch.tensor([0.7, -0.4, 1.2], requires_grad=True)
+    subsets = _legal_subsets(3, 1, 2)
+    scores = torch.stack([logits[list(subset)].sum() for subset in subsets])
+    probabilities = scores.softmax(dim=0)
+    expected_entropy = -(probabilities * probabilities.log()).sum()
+
+    assert constrained_log_partition(logits, 1, 2).item() == pytest.approx(
+        torch.logsumexp(scores, dim=0).item()
+    )
+    entropy = constrained_entropy(logits, 1, 2)
+    assert entropy.item() == pytest.approx(expected_entropy.item())
+    entropy.backward()
+    assert torch.isfinite(logits.grad).all()
+
+
+def test_single_choice_set_log_probability_matches_softmax() -> None:
+    logits = torch.tensor([[0.2, 1.1, -0.3]])
+    option_mask = torch.ones_like(logits, dtype=torch.bool)
+    selected = torch.tensor([[False, True, False]])
+    actual = batch_subset_log_probabilities(
+        logits,
+        option_mask,
+        selected,
+        torch.tensor([1]),
+        torch.tensor([1]),
+    )
+
+    assert torch.allclose(actual, logits.log_softmax(dim=-1)[:, 1])
+
+
+def test_set_selection_respects_bounds_and_deterministic_optimum() -> None:
+    logits = torch.tensor([2.0, 0.5, -1.0, -3.0])
+
+    assert deterministic_subset(logits, 0, 3) == [0, 1]
+    assert deterministic_subset(logits, 3, 3) == [0, 1, 2]
+    assert deterministic_subset(torch.tensor([-1.0, -2.0]), 0, 1) == []
+    for seed in range(20):
+        selected = sample_subset(logits, 1, 3, rng=random.Random(seed))
+        assert 1 <= len(selected) <= 3
+        assert len(selected) == len(set(selected))
 
 
 def test_candidate_model_masks_padding_and_backpropagates() -> None:

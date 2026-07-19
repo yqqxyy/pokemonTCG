@@ -13,6 +13,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, Sampler
 
+from .action_space import batch_subset_log_probabilities, deterministic_subset
 from .data import BCDataset, collate_bc
 from .model import PolicyValueModel, build_model, categorical_value_targets
 
@@ -83,12 +84,43 @@ def batch_loss(
     value_coefficient: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     policy_logits, value_logits = model(batch)
-    policy_loss = -(
+    soft_policy_loss = -(
         batch["policy_target"] * policy_logits.log_softmax(dim=-1)
-    ).sum(dim=-1).mean()
+    ).sum(dim=-1)
+    hard_policy_loss = -batch_subset_log_probabilities(
+        policy_logits,
+        batch["option_mask"],
+        batch["action_mask"],
+        batch["minimum"],
+        batch["maximum"],
+    )
+    policy_loss = torch.where(
+        batch["has_soft_policy_target"], soft_policy_loss, hard_policy_loss
+    ).mean()
     value_targets = categorical_value_targets(batch["value_target"], model.value_support)
     value_loss = -(value_targets * value_logits.log_softmax(dim=-1)).sum(dim=-1).mean()
     return policy_loss + value_coefficient * value_loss, policy_logits, value_logits
+
+
+def policy_correct_count(policy_logits: torch.Tensor, batch: dict[str, torch.Tensor]) -> int:
+    correct = 0
+    for row in range(policy_logits.shape[0]):
+        option_count = int(batch["option_mask"][row].sum())
+        predicted = deterministic_subset(
+            policy_logits[row, :option_count],
+            int(batch["minimum"][row]),
+            int(batch["maximum"][row]),
+        )
+        if bool(batch["has_soft_policy_target"][row]):
+            correct += int(
+                len(predicted) == 1 and float(batch["policy_target"][row, predicted[0]]) > 0.0
+            )
+        else:
+            target = batch["action_mask"][row, :option_count]
+            predicted_mask = torch.zeros_like(target)
+            predicted_mask[predicted] = True
+            correct += int(torch.equal(predicted_mask, target))
+    return correct
 
 
 def evaluate(
@@ -108,9 +140,7 @@ def evaluate(
             loss, policy_logits, value_logits = batch_loss(model, batch, value_coefficient)
             size = batch["action"].shape[0]
             total_loss += float(loss) * size
-            prediction = policy_logits.argmax(dim=-1)
-            predicted_target = batch["policy_target"].gather(1, prediction.unsqueeze(1)).squeeze(1)
-            total_correct += int((predicted_target > 0).sum())
+            total_correct += policy_correct_count(policy_logits, batch)
             predicted_values = model.expected_value(value_logits)
             total_value_error += float((predicted_values - batch["value_target"]).abs().sum())
             total_examples += size
@@ -140,6 +170,10 @@ def train(args: argparse.Namespace) -> tuple[PolicyValueModel, list[EpochMetrics
     if len(data_versions) != 1:
         raise ValueError("Training data cannot mix encoder versions")
     data_version = data_versions.pop()
+    has_multiselect = any(
+        example.decision.minimum != 1 or example.decision.maximum != 1
+        for example in dataset.examples
+    )
     inferred_model_type = {
         1: "mlp_v1",
         2: "transformer_v2",
@@ -193,6 +227,7 @@ def train(args: argparse.Namespace) -> tuple[PolicyValueModel, list[EpochMetrics
         "model_type": model_type,
         "hidden_size": args.hidden_size,
         "value_bins": args.value_bins,
+        "action_space_version": 2 if has_multiselect else 1,
     }
     if model_type in {"transformer_v2", "transformer_v3"}:
         model_config.update(
@@ -232,9 +267,7 @@ def train(args: argparse.Namespace) -> tuple[PolicyValueModel, list[EpochMetrics
             optimizer.step()
             size = batch["action"].shape[0]
             total_loss += float(loss.detach()) * size
-            prediction = policy_logits.argmax(dim=-1)
-            predicted_target = batch["policy_target"].gather(1, prediction.unsqueeze(1)).squeeze(1)
-            total_correct += int((predicted_target > 0).sum())
+            total_correct += policy_correct_count(policy_logits, batch)
             total_examples += size
 
         validation_loss, validation_accuracy, validation_value_mae = evaluate(

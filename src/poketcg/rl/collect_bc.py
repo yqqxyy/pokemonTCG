@@ -11,6 +11,7 @@ from pathlib import Path
 from poketcg.agents import RuleAgent
 from poketcg.engine import OfficialEngine
 
+from .action_space import neural_selection
 from .data import BCExample, write_jsonl
 from .features import build_feature_encoder
 
@@ -32,6 +33,7 @@ def collect_examples(
     games: int,
     seed: int,
     encoder_version: int = 1,
+    include_multiselect: bool = False,
 ) -> tuple[list[BCExample], dict]:
     card_catalog = engine.card_catalog()
     attack_catalog = engine.attack_catalog()
@@ -41,6 +43,7 @@ def collect_examples(
     contexts: Counter[int] = Counter()
     optimal_action_counts: Counter[int] = Counter()
     skipped = 0
+    multiselect_examples = 0
 
     for game in range(games):
         agents = (
@@ -62,23 +65,30 @@ def collect_examples(
                 f"(errorPlayer={start_data.errorPlayer}, errorType={start_data.errorType})."
             )
 
-        pending: list[tuple[object, int, int, list[float]]] = []
+        pending: list[tuple[object, list[int], int, list[float] | None]] = []
         try:
             while int(observation["current"]["result"]) == -1:
                 player = int(observation["current"]["yourIndex"])
                 action = agents[player].choose_action(observation)
                 selection = observation["select"]
-                learnable = (
-                    len(selection["option"]) > 1
-                    and int(selection["minCount"]) == 1
-                    and int(selection["maxCount"]) == 1
-                    and len(action) == 1
+                learnable = neural_selection(
+                    selection, 2 if include_multiselect else 1
                 )
                 if learnable:
                     decision = encoder.encode(observation)
-                    policy_target = optimal_policy_target(agents[player].score_options(observation))
-                    optimal_action_counts[sum(value > 0 for value in policy_target)] += 1
-                    pending.append((decision, int(action[0]), player, policy_target))
+                    single_choice = (
+                        int(selection["minCount"]) == int(selection["maxCount"]) == 1
+                    )
+                    policy_target = (
+                        optimal_policy_target(agents[player].score_options(observation))
+                        if single_choice
+                        else None
+                    )
+                    if policy_target is not None:
+                        optimal_action_counts[sum(value > 0 for value in policy_target)] += 1
+                    else:
+                        multiselect_examples += 1
+                    pending.append((decision, list(action), player, policy_target))
                     contexts[int(selection["context"])] += 1
                 else:
                     skipped += 1
@@ -109,6 +119,8 @@ def collect_examples(
         "context_counts": dict(sorted(contexts.items())),
         "optimal_action_count_histogram": dict(sorted(optimal_action_counts.items())),
         "encoder_version": encoder_version,
+        "include_multiselect": include_multiselect,
+        "multiselect_examples": multiselect_examples,
     }
     return examples, summary
 
@@ -121,6 +133,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--official-dir", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--encoder-version", type=int, choices=(1, 2, 3), default=1)
+    parser.add_argument("--include-multiselect", action="store_true")
     return parser
 
 
@@ -136,6 +149,7 @@ def main(argv: list[str] | None = None) -> int:
         games=args.games,
         seed=args.seed,
         encoder_version=args.encoder_version,
+        include_multiselect=args.include_multiselect,
     )
     write_jsonl(args.output, examples)
     print(json.dumps(summary, indent=2))

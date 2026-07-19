@@ -23,7 +23,7 @@ from .features import (
 @dataclass(slots=True)
 class BCExample:
     decision: EncodedDecision
-    action: int
+    action: int | list[int]
     value_target: float
     player: int
     game: int
@@ -41,14 +41,22 @@ class BCExample:
 
     @classmethod
     def from_dict(cls, value: dict) -> BCExample:
+        raw_action = value["action"]
         return cls(
             decision=EncodedDecision.from_dict(value["decision"]),
-            action=int(value["action"]),
+            action=(
+                [int(index) for index in raw_action]
+                if isinstance(raw_action, list)
+                else int(raw_action)
+            ),
             value_target=float(value["value_target"]),
             player=int(value["player"]),
             game=int(value["game"]),
             policy_target=value.get("policy_target"),
         )
+
+    def action_indices(self) -> list[int]:
+        return [self.action] if isinstance(self.action, int) else list(self.action)
 
 
 class BCDataset(Dataset[BCExample]):
@@ -87,7 +95,9 @@ def collate_bc(examples: list[BCExample]) -> dict[str, Tensor]:
     areas = torch.zeros(batch_size, max_options, dtype=torch.long)
     in_play_areas = torch.zeros(batch_size, max_options, dtype=torch.long)
     option_mask = torch.zeros(batch_size, max_options, dtype=torch.bool)
+    action_mask = torch.zeros(batch_size, max_options, dtype=torch.bool)
     policy_target = torch.zeros(batch_size, max_options, dtype=torch.float32)
+    has_soft_policy_target = torch.zeros(batch_size, dtype=torch.bool)
 
     for row, example in enumerate(examples):
         count = len(example.decision.options)
@@ -96,15 +106,26 @@ def collate_bc(examples: list[BCExample]) -> dict[str, Tensor]:
         areas[row, :count] = torch.tensor(example.decision.areas)
         in_play_areas[row, :count] = torch.tensor(example.decision.in_play_areas)
         option_mask[row, :count] = True
-        if example.policy_target is None:
-            policy_target[row, example.action] = 1.0
-        else:
+        selected = example.action_indices()
+        if len(selected) != len(set(selected)) or any(
+            index < 0 or index >= count for index in selected
+        ):
+            raise ValueError("action indices must be unique and reference valid options")
+        if not example.decision.minimum <= len(selected) <= example.decision.maximum:
+            raise ValueError("action cardinality violates the encoded selection bounds")
+        action_mask[row, selected] = True
+        if example.policy_target is not None:
+            if example.decision.minimum != 1 or example.decision.maximum != 1:
+                raise ValueError("soft policy targets are only supported for single choice")
             if len(example.policy_target) != count:
                 raise ValueError("policy_target length must match the number of options")
             target = torch.tensor(example.policy_target, dtype=torch.float32)
             if not torch.isclose(target.sum(), torch.tensor(1.0), atol=1e-5):
                 raise ValueError("policy_target probabilities must sum to one")
             policy_target[row, :count] = target
+            has_soft_policy_target[row] = True
+        elif example.decision.minimum == example.decision.maximum == 1:
+            policy_target[row, selected[0]] = 1.0
 
     batch = {
         "state": torch.tensor([example.decision.state for example in examples]),
@@ -115,8 +136,14 @@ def collate_bc(examples: list[BCExample]) -> dict[str, Tensor]:
         "areas": areas,
         "in_play_areas": in_play_areas,
         "option_mask": option_mask,
+        "action_mask": action_mask,
         "policy_target": policy_target,
-        "action": torch.tensor([example.action for example in examples]),
+        "has_soft_policy_target": has_soft_policy_target,
+        "action": torch.tensor(
+            [example.action_indices()[0] if example.action_indices() else 0 for example in examples]
+        ),
+        "minimum": torch.tensor([example.decision.minimum for example in examples]),
+        "maximum": torch.tensor([example.decision.maximum for example in examples]),
         "value_target": torch.tensor([example.value_target for example in examples]),
     }
     if version == 1:

@@ -44,6 +44,15 @@ def test_classify_selection_rejects_invalid_bounds() -> None:
         classify_selection(_selection(2, 1, 3))
 
 
+@pytest.mark.parametrize(("minimum", "maximum"), [(2, 2), (0, 1), (1, 3)])
+def test_action_space_v2_classifies_multiselect_as_neural(
+    minimum: int, maximum: int
+) -> None:
+    shape = classify_selection(_selection(3, minimum, maximum), action_version=2)
+
+    assert shape.classification == "neural"
+
+
 def _record(
     *,
     game: int,

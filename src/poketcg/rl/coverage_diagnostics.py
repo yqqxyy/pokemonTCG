@@ -17,6 +17,8 @@ from poketcg.agents import BCPolicyAgent, RandomAgent, RuleAgent
 from poketcg.engine import OfficialEngine
 from poketcg.match import play_match
 
+from .action_space import neural_selection
+from .model import action_space_version
 from .train_bc import resolve_device
 
 
@@ -46,7 +48,7 @@ class CoverageRecord:
     outcome: float = 0.0
 
 
-def classify_selection(selection: dict) -> DecisionShape:
+def classify_selection(selection: dict, action_version: int = 1) -> DecisionShape:
     """Classify a legal selection by whether the current neural policy controls it."""
     option_count = len(selection["option"])
     minimum = int(selection["minCount"])
@@ -58,7 +60,7 @@ def classify_selection(selection: dict) -> DecisionShape:
     )
     if valid_action_count == 1:
         classification = "forced"
-    elif option_count > 1 and minimum == maximum == 1:
+    elif neural_selection(selection, action_version):
         classification = "neural"
     else:
         classification = "resolver"
@@ -157,6 +159,8 @@ class CoverageAgent:
             device=device,
             deterministic=deterministic,
         )
+        saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        self._action_space_version = action_space_version(saved["model_config"])
         self._context_names = context_names
         self._select_type_names = select_type_names
         self._game = 0
@@ -176,7 +180,7 @@ class CoverageAgent:
         state = observation.get("current")
         if selection is None or state is None:
             raise ValueError("CoverageAgent requires a decision observation")
-        shape = classify_selection(selection)
+        shape = classify_selection(selection, self._action_space_version)
         context = int(selection["context"])
         select_type = int(selection["type"])
         self.records.append(
@@ -242,6 +246,7 @@ def _catalog_audit(
     )
     return {
         "model_type": config.get("model_type", "mlp_v1"),
+        "action_space_version": action_space_version(config),
         "card_catalog": {
             "count": len(card_ids),
             "minimum_id": min(card_ids),

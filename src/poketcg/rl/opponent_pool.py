@@ -11,9 +11,10 @@ import torch
 
 from poketcg.agents import Agent, RandomAgent, RuleAgent
 
+from .action_space import neural_selection, sample_subset
 from .data import BCExample, collate_bc
 from .features import FeatureEncoder, build_feature_encoder
-from .model import PolicyValueModel, build_model, encoder_version
+from .model import PolicyValueModel, action_space_version, build_model, encoder_version
 
 
 class FrozenPolicyAgent:
@@ -27,11 +28,13 @@ class FrozenPolicyAgent:
         card_catalog: dict[int, object],
         attack_catalog: dict[int, object],
         seed: int,
+        action_version: int = 1,
     ) -> None:
         self.name = "frozen-policy"
         self._model = model
         self._encoder = encoder
         self._rng = random.Random(seed)
+        self._action_space_version = action_version
         self._fallback = RuleAgent(
             card_catalog=card_catalog,
             attack_catalog=attack_catalog,
@@ -42,18 +45,13 @@ class FrozenPolicyAgent:
         selection = observation.get("select")
         if selection is None:
             raise ValueError("FrozenPolicyAgent received the initial deck-selection observation.")
-        learnable = (
-            len(selection["option"]) > 1
-            and int(selection["minCount"]) == 1
-            and int(selection["maxCount"]) == 1
-        )
-        if not learnable:
+        if not neural_selection(selection, self._action_space_version):
             return self._fallback.choose_action(observation)
 
         decision = self._encoder.encode(observation)
         example = BCExample(
             decision=decision,
-            action=0,
+            action=list(range(decision.minimum)),
             value_target=0.0,
             player=int(observation["current"]["yourIndex"]),
             game=0,
@@ -61,9 +59,13 @@ class FrozenPolicyAgent:
         batch = collate_bc([example])
         with torch.no_grad():
             policy_logits, _ = self._model(batch)
-        probabilities = policy_logits.softmax(dim=-1).squeeze(0).tolist()
-        action = self._rng.choices(range(len(probabilities)), weights=probabilities, k=1)[0]
-        return [action]
+        logits = policy_logits.squeeze(0)
+        return sample_subset(
+            logits,
+            int(selection["minCount"]),
+            int(selection["maxCount"]),
+            rng=self._rng,
+        )
 
 
 @dataclass(slots=True)
@@ -74,6 +76,7 @@ class _PoolEntry:
     model: PolicyValueModel | None = None
     model_config: dict[str, Any] | None = None
     encoder_version: int = 1
+    action_space_version: int = 1
     games: int = 0
     score_sum: float = 0.0
     ema_score: float = 0.5
@@ -154,6 +157,7 @@ class OpponentPool:
                 model=model,
                 model_config=dict(saved["model_config"]),
                 encoder_version=encoder_version(saved["model_config"]),
+                action_space_version=action_space_version(saved["model_config"]),
             )
         )
 
@@ -175,6 +179,7 @@ class OpponentPool:
                 model=frozen,
                 model_config=dict(model_config),
                 encoder_version=encoder_version(model_config),
+                action_space_version=action_space_version(model_config),
             )
         )
         if len(self._snapshots) > self._max_snapshots:
@@ -254,6 +259,7 @@ class OpponentPool:
                 card_catalog=self._cards,
                 attack_catalog=self._attacks,
                 seed=seed,
+                action_version=entry.action_space_version,
             )
         return entry.name, agent
 
@@ -286,6 +292,7 @@ class OpponentPool:
                 "name": entry.name,
                 "kind": entry.kind,
                 "encoder_version": entry.encoder_version,
+                "action_space_version": entry.action_space_version,
             }
             if entry.model is not None:
                 if entry.model_config is None:

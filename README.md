@@ -151,33 +151,40 @@ V3 保留 V2 的所有可见状态 token，并增加：
 
 ```bash
 python -m poketcg.rl.collect_bc \
-  --games 2000 --encoder-version 3 --seed 20260724 \
-  --output artifacts/bc/rule_v3_semantic_history_2000.jsonl
+  --games 2000 --encoder-version 3 --include-multiselect --seed 20260724 \
+  --output artifacts/bc/rule_v3_semantic_actions_v2_2000.jsonl
 ```
 
-训练完整 V3（4,141,414 参数）：
+沿用当前表现最好的 semantic-only 配置训练 Action Space V2：
 
 ```bash
 python -m poketcg.rl.train_bc \
-  --input artifacts/bc/rule_v3_semantic_history_2000.jsonl \
-  --output artifacts/checkpoints/bc_rule_v3_semantic_history_2000.pt \
+  --input artifacts/bc/rule_v3_semantic_actions_v2_2000.jsonl \
+  --output artifacts/checkpoints/bc_rule_v3_semantic_actions_v2_2000.pt \
   --epochs 10 --batch-size 64 --learning-rate 0.0002 \
   --hidden-size 256 --model-type transformer_v3 \
   --num-layers 3 --num-heads 4 --dropout 0.1 \
+  --disable-history \
   --device mps --seed 20260724
 ```
 
-同一份 V3 数据可直接做四组严格消融。分别增加 `--disable-card-semantics`、
-`--disable-history`，或同时增加两者；checkpoint 会记录开关，之后 BC Agent、PPO、对手池、
-固定面板和 Value diagnostics 会自动恢复相同结构。V3 仍只学习单选决策，多选动作暂时保留
-RuleAgent fallback，避免把输入升级和动作空间升级混在同一轮实验中。
+同一份 V3 数据仍可做四组严格消融：完整模型、去语义、去历史，以及两者都去掉；checkpoint
+会记录开关，之后 BC Agent、PPO、对手池、固定面板和 Value diagnostics 会自动恢复相同结构。
+
+`--include-multiselect` 开启 Action Space V2。策略不再把一个合法集合枚举成一个巨大的离散
+动作，而是给每个 option 输出一个 logit，并在 `minCount <= |S| <= maxCount` 的全部集合上定义
+`P(S) ∝ exp(sum(i in S) logit_i)`。分区函数、采样、BC NLL、PPO ratio 和 entropy 都用动态规划
+精确计算；单选是它的严格特例。新 checkpoint 会直接控制 `ATTACH_TO`、
+`SETUP_BENCH_POKEMON`、`TO_HAND` 等多选决策；旧 checkpoint 未记录动作空间版本，仍自动按 V1
+交给 RuleAgent，保持历史实验可复现。动作空间变了，因此需要重新采集 BC 数据并从新的 BC
+checkpoint 开始一条 PPO 实验线，不能只给旧 checkpoint 改配置字段。
 
 用 GAE + Masked PPO 继续对 RuleAgent 微调：
 
 ```bash
 python -m poketcg.rl.train_ppo \
-  --input artifacts/checkpoints/bc_rule_v1_soft_2000.pt \
-  --output artifacts/checkpoints/ppo_rule_v1_soft_20.pt \
+  --input artifacts/checkpoints/bc_rule_v3_semantic_actions_v2_2000.pt \
+  --output artifacts/checkpoints/ppo_v3_semantic_actions_v2_rule_20.pt \
   --iterations 20 --games-per-iteration 128 \
   --device mps --rollout-device cpu \
   --checkpoint-every 5 --seed 20260717
@@ -240,8 +247,9 @@ python -m poketcg.rl.coverage_diagnostics \
   --output results/diagnostics/bc_rule_v2_coverage_rule500.json
 ```
 
-报告把决策分为：只有一个合法结果的 `forced`、当前网络处理的单选 `neural`，以及仍由规则
-fallback 处理的 `resolver`（通常是多选）。判断覆盖率应看排除强制动作后的
+报告把决策分为：只有一个合法结果的 `forced`、当前网络处理的 `neural`，以及仍由规则
+fallback 处理的 `resolver`。Action Space V1 的 resolver 通常是多选；V2 checkpoint 应使其降为
+0。判断覆盖率应看排除强制动作后的
 `strategic_neural_coverage`。按 context 显示的胜率只是相关性诊断，不能当作该 context 的因果
 影响。报告还会审计 card/attack embedding 的 ID 范围、当前牌组，以及 observation 中已有但
 V2 尚未编码的公开事件日志；指定 `--output` 时同时保存逐决策 `_records.jsonl`。

@@ -8,14 +8,14 @@ from collections import defaultdict
 from pathlib import Path
 
 import torch
-from torch.distributions import Categorical
 from torch.utils.data import DataLoader
 
 from poketcg.agents.rule_agent import SelectContext
 
+from .action_space import batch_subset_entropies, batch_subset_log_probabilities
 from .data import BCDataset, collate_bc
 from .model import build_model
-from .train_bc import move_batch, resolve_device
+from .train_bc import move_batch, policy_correct_count, resolve_device
 
 
 def _context_name(context: int) -> str:
@@ -53,16 +53,36 @@ def diagnose(
         for raw_batch in loader:
             batch = move_batch(raw_batch, device)
             policy_logits, value_logits = model(batch)
-            prediction = policy_logits.argmax(dim=-1)
-            entropy = Categorical(logits=policy_logits).entropy()
+            entropy = batch_subset_entropies(
+                policy_logits,
+                batch["option_mask"],
+                batch["minimum"],
+                batch["maximum"],
+            )
+            hard_target_probability = batch_subset_log_probabilities(
+                policy_logits,
+                batch["option_mask"],
+                batch["action_mask"],
+                batch["minimum"],
+                batch["maximum"],
+            ).exp()
             value_error = (model.expected_value(value_logits) - batch["value_target"]).abs()
             for row in range(batch["action"].shape[0]):
                 context = int(batch["context"][row])
                 item = totals[context]
                 item["count"] += 1
-                predicted_target = batch["policy_target"][row, prediction[row]]
-                item["correct"] += float(predicted_target > 0)
-                item["target_probability"] += float(predicted_target)
+                row_batch = {key: value[row : row + 1] for key, value in batch.items()}
+                item["correct"] += policy_correct_count(
+                    policy_logits[row : row + 1], row_batch
+                )
+                if bool(batch["has_soft_policy_target"][row]):
+                    probabilities = policy_logits[row].softmax(dim=-1)
+                    target_probability = (
+                        probabilities * batch["policy_target"][row]
+                    ).sum()
+                else:
+                    target_probability = hard_target_probability[row]
+                item["target_probability"] += float(target_probability)
                 item["entropy"] += float(entropy[row])
                 item["value_error"] += float(value_error[row])
 

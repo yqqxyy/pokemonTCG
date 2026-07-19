@@ -7,9 +7,10 @@ from pathlib import Path
 
 import torch
 
+from poketcg.rl.action_space import deterministic_subset, neural_selection, sample_subset
 from poketcg.rl.data import BCExample, collate_bc
 from poketcg.rl.features import build_feature_encoder
-from poketcg.rl.model import build_model, encoder_version
+from poketcg.rl.model import action_space_version, build_model, encoder_version
 
 from .rule_agent import RuleAgent
 
@@ -37,6 +38,7 @@ class BCPolicyAgent:
         self._model.eval()
         self._deterministic = deterministic
         self._rng = random.Random(seed)
+        self._action_space_version = action_space_version(saved["model_config"])
         self._encoder = build_feature_encoder(
             encoder_version(saved["model_config"]),
             card_catalog,
@@ -52,18 +54,13 @@ class BCPolicyAgent:
         selection = observation.get("select")
         if selection is None:
             raise ValueError("BCPolicyAgent received the initial deck-selection observation.")
-        learnable = (
-            len(selection["option"]) > 1
-            and int(selection["minCount"]) == 1
-            and int(selection["maxCount"]) == 1
-        )
-        if not learnable:
+        if not neural_selection(selection, self._action_space_version):
             return self._fallback.choose_action(observation)
 
         decision = self._encoder.encode(observation)
         example = BCExample(
             decision=decision,
-            action=0,
+            action=list(range(decision.minimum)),
             value_target=0.0,
             player=int(observation["current"]["yourIndex"]),
             game=0,
@@ -73,7 +70,9 @@ class BCPolicyAgent:
         }
         with torch.no_grad():
             logits, _ = self._model(batch)
+        valid_logits = logits.squeeze(0)
+        minimum = int(selection["minCount"])
+        maximum = int(selection["maxCount"])
         if self._deterministic:
-            return [int(logits.argmax(dim=-1).item())]
-        probabilities = logits.softmax(dim=-1).squeeze(0).cpu().tolist()
-        return [self._rng.choices(range(len(probabilities)), weights=probabilities, k=1)[0]]
+            return deterministic_subset(valid_logits, minimum, maximum)
+        return sample_subset(valid_logits, minimum, maximum, rng=self._rng)

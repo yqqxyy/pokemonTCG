@@ -149,12 +149,13 @@ python -m poketcg.rl.coverage_diagnostics \
   --output /content/drive/MyDrive/pokemonTCG/results/MODEL_coverage_rule500.json
 ```
 
-The report separates decisions into `forced` (only one legal result), `neural` (single-choice and
-handled by the policy), and `resolver` (currently handled by the deterministic fallback, usually
-multi-select). `strategic_neural_coverage` excludes forced choices and is the coverage number to
-watch. Context-level win rates are observational diagnostics, not causal estimates of whether a
-context helps or hurts. The command also audits card/attack ID ranges, the active deck, and public
-engine logs; its companion `_records.jsonl` file supports deeper analysis without another rollout.
+The report separates decisions into `forced` (only one legal result), `neural` (handled by the
+policy), and `resolver` (handled by the deterministic fallback). Action Space V1 checkpoints leave
+multi-select decisions in `resolver`; V2 checkpoints should reduce `resolver` to zero.
+`strategic_neural_coverage` excludes forced choices and is the coverage number to watch.
+Context-level win rates are observational diagnostics, not causal estimates. The command also
+audits card/attack ID ranges, the active deck, and public engine logs; its companion
+`_records.jsonl` file supports deeper analysis without another rollout.
 
 ## Train FeatureEncoder V3 before PPO
 
@@ -164,27 +165,33 @@ tokens. Collect a fresh dataset because V1/V2 JSONL files do not contain these f
 ```bash
 mkdir -p /content/drive/MyDrive/pokemonTCG/bc
 python -m poketcg.rl.collect_bc \
-  --games 2000 --encoder-version 3 --seed 20260724 \
-  --output /content/drive/MyDrive/pokemonTCG/bc/rule_v3_semantic_history_2000.jsonl
+  --games 2000 --encoder-version 3 --include-multiselect --seed 20260724 \
+  --output /content/drive/MyDrive/pokemonTCG/bc/rule_v3_semantic_actions_v2_2000.jsonl
 ```
 
-Train the full V3 checkpoint on T4:
+Train the selected semantic-only V3 checkpoint with Action Space V2 on T4:
 
 ```bash
 python -m poketcg.rl.train_bc \
-  --input /content/drive/MyDrive/pokemonTCG/bc/rule_v3_semantic_history_2000.jsonl \
-  --output /content/drive/MyDrive/pokemonTCG/checkpoints/bc_rule_v3_semantic_history_2000.pt \
+  --input /content/drive/MyDrive/pokemonTCG/bc/rule_v3_semantic_actions_v2_2000.jsonl \
+  --output /content/drive/MyDrive/pokemonTCG/checkpoints/bc_rule_v3_semantic_actions_v2_2000.pt \
   --epochs 10 --batch-size 64 --learning-rate 0.0002 \
   --hidden-size 256 --model-type transformer_v3 \
   --num-layers 3 --num-heads 4 --dropout 0.1 \
+  --disable-history \
   --device cuda --seed 20260724
 ```
 
-Run controlled ablations from the same JSONL by adding `--disable-card-semantics`,
-`--disable-history`, or both to the training command and changing the output filename. Evaluate all
-four checkpoints on the same paired-seat panel before starting PPO. Once selected, put that V3
-checkpoint into the notebook's `input_checkpoint`; the PPO trainer and spawned workers infer encoder
-V3 automatically from its model configuration.
+The same JSONL supports all four controlled ablations: full V3, no semantics, no history, or neither.
+Change the two disable flags and output filename as needed. Evaluate them on the same paired-seat
+panel before PPO. Put the selected V3 checkpoint into the notebook's `input_checkpoint`; the PPO
+trainer and spawned workers infer encoder V3 automatically from its model configuration.
+
+`--include-multiselect` enables Action Space V2. It learns a cardinality-constrained set
+distribution instead of enumerating every legal subset, and the same exact set log-probability is
+used by BC, rollout workers, and PPO. Single-choice behavior is unchanged. Start a new PPO line from
+this expanded BC checkpoint; old checkpoints intentionally remain Action Space V1 for reproducible
+comparisons.
 
 If the GitHub repository is private, authenticate the clone through a Colab Secret or clone it
 manually. Do not put a personal access token directly in the notebook.
