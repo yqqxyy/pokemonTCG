@@ -21,7 +21,7 @@ The default training command uses:
 - eight spawned CPU workers, each with an isolated official simulator;
 - 512 games per iteration;
 - batch size 512;
-- Actor GAE lambda 0.95 with an independently configured critic lambda of 1.0;
+- Actor and critic GAE lambda 0.95, independently configurable for ablations;
 - PFSP population sampling with a reduced historical self-play weight;
 - checkpoints written to Drive every two iterations;
 - live experiment and system metrics in a W&B project named `pokemon-tcg-ai-battle`.
@@ -72,7 +72,7 @@ Potential-based shaping is optional and disabled by default. Enable it for an ex
 POKETCG_REWARD_SHAPING=prize \
 POKETCG_REWARD_SHAPING_SCALE=1.0 \
 POKETCG_GAE_LAMBDA=0.95 \
-POKETCG_VALUE_GAE_LAMBDA=1.0 \
+POKETCG_VALUE_GAE_LAMBDA=0.95 \
 WANDB_RUN_NAME=ppo-v2-prize-pbrs \
 bash scripts/train_colab_ppo.sh INPUT.pt OUTPUT.pt
 ```
@@ -92,10 +92,10 @@ many games because potential differences telescope. Use the same starting checkp
 
 ## Decoupled actor and critic lambda
 
-The Colab script now defaults to `POKETCG_GAE_LAMBDA=0.95` for policy advantages and
-`POKETCG_VALUE_GAE_LAMBDA=1.0` for critic targets. With `gamma=1`, the latter telescopes to the
-actual terminal outcome at every learner decision, while the actor keeps the lower-variance GAE
-estimate. To run the terminal-reward experiment from the original population checkpoint:
+The Colab script defaults to `POKETCG_GAE_LAMBDA=0.95` for policy advantages and
+`POKETCG_VALUE_GAE_LAMBDA=0.95` for critic targets. A completed ablation with critic lambda 1.0
+produced noisier early-game targets and did not improve the fixed panel, so it is no longer the
+recommended default. To reproduce that Monte Carlo-target ablation explicitly:
 
 ```bash
 POKETCG_REWARD_SHAPING=none \
@@ -137,6 +137,24 @@ Calibration rows are decision-weighted, so long games contribute more states. Th
 is included to check that a result is not caused only by a few unusually long trajectories. Add
 `--stochastic` only when deliberately diagnosing the sampled training policy rather than reproducing
 the deterministic fixed panel.
+
+## Decision coverage and input audit
+
+Before changing the model, measure which official decisions the neural policy actually controls:
+
+```bash
+python -m poketcg.rl.coverage_diagnostics \
+  --checkpoint /content/drive/MyDrive/pokemonTCG/checkpoints/MODEL.pt \
+  --opponent rule --games-per-seat 500 --device cpu \
+  --output /content/drive/MyDrive/pokemonTCG/results/MODEL_coverage_rule500.json
+```
+
+The report separates decisions into `forced` (only one legal result), `neural` (single-choice and
+handled by the policy), and `resolver` (currently handled by the deterministic fallback, usually
+multi-select). `strategic_neural_coverage` excludes forced choices and is the coverage number to
+watch. Context-level win rates are observational diagnostics, not causal estimates of whether a
+context helps or hurts. The command also audits card/attack ID ranges, the active deck, and public
+engine logs; its companion `_records.jsonl` file supports deeper analysis without another rollout.
 
 If the GitHub repository is private, authenticate the clone through a Colab Secret or clone it
 manually. Do not put a personal access token directly in the notebook.
