@@ -50,6 +50,10 @@ class BCPolicyAgent:
             seed=seed,
         )
 
+    @property
+    def action_space_version(self) -> int:
+        return self._action_space_version
+
     def choose_action(self, observation: dict) -> list[int]:
         selection = observation.get("select")
         if selection is None:
@@ -76,3 +80,40 @@ class BCPolicyAgent:
         if self._deterministic:
             return deterministic_subset(valid_logits, minimum, maximum)
         return sample_subset(valid_logits, minimum, maximum, rng=self._rng)
+
+
+class HybridPolicyAgent:
+    """Route exact-one decisions to one policy and set decisions to another."""
+
+    name = "hybrid-policy"
+
+    def __init__(
+        self,
+        single_checkpoint: str | Path,
+        multiselect_checkpoint: str | Path,
+        *,
+        card_catalog: dict[int, object],
+        attack_catalog: dict[int, object],
+        seed: int | None = None,
+        device: str = "cpu",
+        deterministic: bool = True,
+    ) -> None:
+        common = {
+            "card_catalog": card_catalog,
+            "attack_catalog": attack_catalog,
+            "seed": seed,
+            "device": device,
+            "deterministic": deterministic,
+        }
+        self._single_policy = BCPolicyAgent(single_checkpoint, **common)
+        self._multiselect_policy = BCPolicyAgent(multiselect_checkpoint, **common)
+        if self._multiselect_policy.action_space_version < 2:
+            raise ValueError("The multiselect checkpoint must use Action Space V2 or newer")
+
+    def choose_action(self, observation: dict) -> list[int]:
+        selection = observation.get("select")
+        if selection is None:
+            raise ValueError("HybridPolicyAgent received the initial deck-selection observation.")
+        exact_one = int(selection["minCount"]) == int(selection["maxCount"]) == 1
+        policy = self._single_policy if exact_one else self._multiselect_policy
+        return policy.choose_action(observation)

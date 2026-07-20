@@ -206,5 +206,17 @@ used by BC, rollout workers, and PPO. Single-choice behavior is unchanged. Start
 this expanded BC checkpoint; old checkpoints intentionally remain Action Space V1 for reproducible
 comparisons.
 
+To test an old policy's exact-one decisions together with an Action Space V2 policy's set
+decisions, add `--multiselect-checkpoint` to the fixed panel. This loads two independent models and
+does not rewrite either checkpoint:
+
+```bash
+python -m poketcg.rl.evaluate_panel \
+  --checkpoint /content/drive/MyDrive/pokemonTCG/checkpoints/OLD_SINGLE_POLICY.pt \
+  --multiselect-checkpoint /content/drive/MyDrive/pokemonTCG/checkpoints/ACTION_V2_POLICY.pt \
+  --games-per-seat 500 --stochastic \
+  --output /content/drive/MyDrive/pokemonTCG/results/hybrid_policy_final500.json
+```
+
 If the GitHub repository is private, authenticate the clone through a Colab Secret or clone it
 manually. Do not put a personal access token directly in the notebook.

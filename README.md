@@ -179,6 +179,17 @@ python -m poketcg.rl.train_bc \
 交给 RuleAgent，保持历史实验可复现。动作空间变了，因此需要重新采集 BC 数据并从新的 BC
 checkpoint 开始一条 PPO 实验线，不能只给旧 checkpoint 改配置字段。
 
+可用混合策略消融隔离多选策略的贡献：`--checkpoint` 只负责恰好选择一个 option 的决策，
+`--multiselect-checkpoint` 负责其余集合决策。两个模型独立加载，不修改 checkpoint：
+
+```bash
+python -m poketcg.rl.evaluate_panel \
+  --checkpoint artifacts/checkpoints/OLD_SINGLE_POLICY.pt \
+  --multiselect-checkpoint artifacts/checkpoints/ACTION_V2_POLICY.pt \
+  --games-per-seat 500 --stochastic \
+  --output results/evaluation/hybrid_policy_final500.json
+```
+
 用 GAE + Masked PPO 继续对 RuleAgent 微调：
 
 ```bash

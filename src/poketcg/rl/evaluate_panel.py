@@ -7,7 +7,7 @@ import json
 import math
 from pathlib import Path
 
-from poketcg.agents import BCPolicyAgent, RandomAgent, RuleAgent
+from poketcg.agents import BCPolicyAgent, HybridPolicyAgent, RandomAgent, RuleAgent
 from poketcg.engine import OfficialEngine
 from poketcg.match import MatchResult, play_match
 
@@ -64,6 +64,7 @@ def evaluate_panel(
     deck_path: str | Path | None = None,
     stochastic: bool = False,
     policy_opponents: list[str | Path] | None = None,
+    multiselect_checkpoint: str | Path | None = None,
 ) -> dict:
     engine = OfficialEngine(official_dir)
     deck = engine.load_deck(deck_path or engine.sample_deck_path)
@@ -79,13 +80,20 @@ def evaluate_panel(
     for opponent_index, (opponent_name, opponent_checkpoint) in enumerate(opponent_specs):
         for model_player in (0, 1):
             pairing_seed = seed + opponent_index * 100_000 + model_player * 10_000
-            model = BCPolicyAgent(
-                checkpoint,
-                card_catalog=card_catalog,
-                attack_catalog=attack_catalog,
-                seed=pairing_seed,
-                deterministic=not stochastic,
-            )
+            agent_options = {
+                "card_catalog": card_catalog,
+                "attack_catalog": attack_catalog,
+                "seed": pairing_seed,
+                "deterministic": not stochastic,
+            }
+            if multiselect_checkpoint is None:
+                model = BCPolicyAgent(checkpoint, **agent_options)
+            else:
+                model = HybridPolicyAgent(
+                    checkpoint,
+                    multiselect_checkpoint,
+                    **agent_options,
+                )
             if opponent_checkpoint is None:
                 baseline = _opponent(
                     opponent_name,
@@ -125,6 +133,11 @@ def evaluate_panel(
     low, high = wilson_interval(total_wins, len(all_results))
     return {
         "checkpoint": str(Path(checkpoint).resolve()),
+        "multiselect_checkpoint": (
+            str(Path(multiselect_checkpoint).resolve())
+            if multiselect_checkpoint is not None
+            else None
+        ),
         "games_per_seat": games_per_seat,
         "action_selection": "stochastic" if stochastic else "deterministic",
         "policy_opponents": [str(Path(path).resolve()) for path in policy_opponents or []],
@@ -150,6 +163,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--stochastic", action="store_true")
     parser.add_argument("--policy-opponent", type=Path, action="append", default=[])
+    parser.add_argument(
+        "--multiselect-checkpoint",
+        type=Path,
+        help=(
+            "Use --checkpoint for exact-one decisions and this Action Space V2 "
+            "checkpoint for multi-select decisions."
+        ),
+    )
     return parser
 
 
@@ -163,6 +184,7 @@ def main(argv: list[str] | None = None) -> int:
         deck_path=args.deck,
         stochastic=args.stochastic,
         policy_opponents=args.policy_opponent,
+        multiselect_checkpoint=args.multiselect_checkpoint,
     )
     rendered = json.dumps(result, indent=2)
     if args.output:
