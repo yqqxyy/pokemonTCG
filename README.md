@@ -331,6 +331,125 @@ python -m poketcg.rl.train_ppo \
 91.6%，RuleAgent 57.3%，对 population v1 起点 51.9%，对更早的 fixed-Rule PPO 52.8%。这些
 提升幅度仍较小，但相较 v1 已从“与历史策略持平”变为对两个历史策略均取得正向点估计。
 
+## Policy-Value MCTS
+
+当前官方 `cg.api` 已提供 `search_begin`、`search_step` 和 `search_end`。原生库为正式
+`BattleStart` 与搜索 `AgentStart` 分配不同实例；`search_step(search_id, action)` 从指定父状态
+复制子状态，因此不会直接改写正式对局状态。搜索树内部仍共享 search-side RNG 流，随机分支
+并不是 common-random-number 配对样本。MCTS 使用现有 PPO checkpoint 提供 action prior 和
+叶节点 Value，并用 PUCT 在官方模拟器的真实状态转移上向前搜索。
+
+第一版实现有意保持保守：
+
+- 只在 `SelectContext.MAIN` 作为根节点时搜索，卡牌效果内部的后续选择仍会进入搜索树；
+- 单选节点按 Policy prior 展开至多 `max_actions` 个动作；
+- Action Space V1 checkpoint 的多选节点只使用原 RuleAgent 动作，避免组合爆炸；
+- Value 全部以根玩家视角累计，对手节点选择时最小化根玩家 Q，不能按 selection 深度翻转；
+- 从双方完整牌组先验减去当前可见卡牌，采样隐藏 hand/deck/prize；可把固定总模拟预算拆到多棵
+  独立 determinization 搜索树，再汇总根节点 visit/Q。
+
+运行 16-simulation PUCT 对 RuleAgent：
+
+```bash
+python -m poketcg.cli \
+  --games 50 --seed 20260901 \
+  --player0 mcts --player1 rule \
+  --checkpoint artifacts/checkpoints/ppo_v3_semantic_population_iter0018.pt \
+  --stochastic \
+  --mcts-simulations 16 --mcts-max-depth 12 --mcts-max-actions 16 \
+  --output results/evaluation/mcts16_as_player0_50.jsonl
+```
+
+正式比较必须交换 `player0/player1`。每座位 500 局的 8/16/32 simulations 消融结果分别为
+59.0%、63.9%、63.9%，因此当前性价比拐点是 16。固定 16 总预算时，det=1/2/4 分别为
+62.5%、59.1%、61.1%；把总预算增至 32、拆成两棵各 16 次的树也只有 62.7%，没有观察到
+多次 determinization 的收益。完整区间、先后手和耗时见
+[`docs/MCTS_EXPERIMENTS.md`](docs/MCTS_EXPERIMENTS.md)。
+
+当前隐藏状态推断在离线同牌组评测中假设对手使用相同 deck。提交到公开 ladder 前必须加入
+对手牌组 belief/候选 archetype，或者把搜索仅用于离线 Expert Iteration；否则搜索质量会受
+错误的 opponent deck prior 限制。
+
+双座位固定面板入口会在每个座位只加载一次 checkpoint，并报告 Wilson 95% 区间、搜索节点数、
+深度和耗时。下面是 8/16/32 simulations 消融的单条命令模板：
+
+```bash
+python -m poketcg.rl.evaluate_mcts \
+  --checkpoint artifacts/checkpoints/ppo_v3_semantic_population_iter0018.pt \
+  --games-per-seat 500 --seed 20261101 \
+  --simulations 16 --determinizations 1 --torch-threads 1 \
+  --output results/evaluation/mcts_sims16_rule_500x2.json
+```
+
+加入多次 determinization 和候选牌组 belief：
+
+```bash
+python -m poketcg.rl.evaluate_mcts \
+  --checkpoint artifacts/checkpoints/ppo_v3_semantic_population_iter0018.pt \
+  --games-per-seat 500 --seed 20261103 \
+  --simulations 16 --determinizations 4 --torch-threads 1 \
+  --opponent-deck sample=data/official/sample_submission/sample_submission/deck.csv \
+  --opponent-deck meta_a=configs/opponent_decks/meta_a.csv \
+  --opponent-deck fishcat_v8=configs/opponent_decks/fishcat_v8.csv \
+  --opponent-deck mcts_sample=configs/opponent_decks/mcts_sample.csv \
+  --output results/evaluation/mcts_sims16_det04_belief_rule_500x2.json
+```
+
+belief 会累计本局事件日志中已经公开的对手卡牌，并结合当前场面/弃牌区的可见实体，按候选
+牌组与证据的相容性更新后验；每局开始前清空证据。输出中的
+`opponent_deck_samples` 可以检查实际 determinization 采样是否符合预期。候选表只是实验接口，
+不是完整 meta；正式提交前应按最新公开牌组和本地对战记录更新。
+
+验证 belief 时不要只打 sample mirror：`--actual-opponent-deck` 控制 RuleAgent 真正使用的牌组，
+`--fixed-opponent-prior-deck` 控制不启用 belief 时 MCTS 假设的对手牌组。应在同一实际对手上比较
+错误 fixed prior、正确 oracle prior、以及候选 belief 三臂；oracle 是性能上界，belief 的目标是
+在不知道实际牌组时逼近它。
+
+## Expert Iteration：蒸馏 MCTS
+
+`collect_expert_iteration` 运行当前 checkpoint 的 MCTS self-play。MAIN 根节点使用搜索子节点
+visit count 作为软 Policy 标签；其他可学习选择使用原 Policy 分布作 replay，避免微调后遗忘
+卡牌效果内部决策。所有样本在对局结束后从各自玩家视角回填 `-1/0/+1` Value target。
+
+Colab Round 1 推荐先采集 2000 局。逐动作小模型推理在 CPU 上通常比 T4 更快，GPU 留给后续
+批量训练：
+
+```bash
+cd /content/pokemonTCG
+python -m poketcg.rl.collect_expert_iteration \
+  --checkpoint /content/drive/MyDrive/pokemonTCG/checkpoints/ppo_v3_semantic_population_iter0018.pt \
+  --games 2000 --simulations 16 --determinizations 1 \
+  --target-temperature 1.0 --replay-temperature 1.0 \
+  --device cpu --torch-threads 1 --seed 20260810 \
+  --output /content/drive/MyDrive/pokemonTCG/expert_iteration/mcts16_round1_2000.jsonl
+```
+
+从原 iter0018 权重微调，不要随机初始化同一个 411 万参数模型：
+
+```bash
+python -m poketcg.rl.train_bc \
+  --input /content/drive/MyDrive/pokemonTCG/expert_iteration/mcts16_round1_2000.jsonl \
+  --initialize-from /content/drive/MyDrive/pokemonTCG/checkpoints/ppo_v3_semantic_population_iter0018.pt \
+  --output /content/drive/MyDrive/pokemonTCG/checkpoints/expert_iter_round1_mcts16_2000.pt \
+  --epochs 5 --batch-size 128 --learning-rate 0.00003 \
+  --value-coefficient 0.25 --max-grad-norm 0.5 \
+  --device cuda --seed 20260810
+```
+
+最后仍使用 MCTS16 做双座位固定面板，不能仅凭训练 loss 选模型：
+
+```bash
+python -m poketcg.rl.evaluate_mcts \
+  --checkpoint /content/drive/MyDrive/pokemonTCG/checkpoints/expert_iter_round1_mcts16_2000.pt \
+  --games-per-seat 500 --seed 20260811 \
+  --simulations 16 --determinizations 1 --torch-threads 1 \
+  --output /content/drive/MyDrive/pokemonTCG/results/expert_iter_round1_rule_500x2.json
+```
+
+本地 100 局采集 screen 产生 2439 条样本，其中 1891 条为 MCTS visit 标签。新 checkpoint
+在 RuleAgent 100×2 面板上的点估计为 65.0%，原 iter0018 同配置为 62.5%；区间重叠，因此
+只说明管线可用，不能替代上面的 500×2 正式评测。
+
 如果官方 sample submission 不在默认位置，可显式指定：
 
 ```bash
@@ -341,6 +460,41 @@ poketcg-evaluate --official-dir /absolute/path/to/sample_submission
 
 ```text
 data/official/sample_submission/sample_submission
+```
+
+## 构建 Kaggle Agent 提交包
+
+提交前把目标 checkpoint 放到本地或已挂载的 Drive 路径，然后生成自包含归档：
+
+```bash
+python -m poketcg.submission \
+  --checkpoint artifacts/checkpoints/ppo_v3_semantic_population_iter0018.pt \
+  --output artifacts/submissions/ppo_v3_iter0018/submission.tar.gz
+```
+
+构建当前推荐的 MCTS 提交（16 simulations、单次 determinization）：
+
+```bash
+python -m poketcg.submission \
+  --checkpoint artifacts/checkpoints/ppo_v3_semantic_population_iter0018.pt \
+  --mcts-simulations 16 --mcts-determinizations 1 \
+  --mcts-c-puct 1.25 --mcts-max-depth 12 --mcts-max-actions 16 \
+  --output artifacts/submissions/mcts16_ppo_v3_iter0018/submission.tar.gz
+```
+
+归档中的 `agent_config.json` 决定线上使用 direct policy 还是 MCTS。MCTS runtime 使用官方
+Search API；初始化或搜索失败时依次降级到原 PPO policy、RuleAgent 和最小合法动作。
+
+构建器会只保留 checkpoint 中的模型配置和参数，并把 `main.py`、`deck.csv`、项目推理代码及
+官方 `cg` 运行库放在 tar 根目录。线上策略使用 stochastic 采样；模型异常时依次退回
+RuleAgent 和最小合法动作。上传前应从归档解压到空目录并至少完成一局官方引擎冒烟测试。
+
+确认归档后使用已认证的 Kaggle CLI 上传：
+
+```bash
+kaggle competitions submit pokemon-tcg-ai-battle \
+  -f artifacts/submissions/ppo_v3_iter0018/submission.tar.gz \
+  -m "PPO V3 semantic iter0018 baseline before MCTS"
 ```
 
 ## 测试与代码检查

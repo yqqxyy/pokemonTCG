@@ -103,7 +103,7 @@ def deterministic_subset(logits: Tensor, minimum: int, maximum: int) -> list[int
     cumulative = detached.new_zeros(())
     scores: dict[int, float] = {0: 0.0}
     for count, index in enumerate(ranked, start=1):
-        cumulative = cumulative + logits[index]
+        cumulative = cumulative + detached[index]
         scores[count] = float(cumulative)
     selected_count = max(range(minimum, maximum + 1), key=scores.__getitem__)
     return sorted(ranked[:selected_count])

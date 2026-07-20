@@ -31,6 +31,9 @@ poketcg-diagnose = "poketcg.rl.diagnose:main"
 poketcg-value-diagnostics = "poketcg.rl.value_diagnostics:main"
 poketcg-coverage-diagnostics = "poketcg.rl.coverage_diagnostics:main"
 poketcg-evaluate-panel = "poketcg.rl.evaluate_panel:main"
+poketcg-evaluate-mcts = "poketcg.rl.evaluate_mcts:main"
+poketcg-collect-expert = "poketcg.rl.collect_expert_iteration:main"
+poketcg-build-submission = "poketcg.submission:main"
 
 
 [tool.setuptools]

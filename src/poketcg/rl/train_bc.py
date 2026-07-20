@@ -15,7 +15,12 @@ from torch.utils.data import DataLoader, Sampler
 
 from .action_space import batch_subset_log_probabilities, deterministic_subset
 from .data import BCDataset, collate_bc
-from .model import PolicyValueModel, build_model, categorical_value_targets
+from .model import (
+    PolicyValueModel,
+    action_space_version,
+    build_model,
+    categorical_value_targets,
+)
 
 
 @dataclass(slots=True)
@@ -112,8 +117,17 @@ def policy_correct_count(policy_logits: torch.Tensor, batch: dict[str, torch.Ten
             int(batch["maximum"][row]),
         )
         if bool(batch["has_soft_policy_target"][row]):
+            target = batch["policy_target"][row, :option_count]
             correct += int(
-                len(predicted) == 1 and float(batch["policy_target"][row, predicted[0]]) > 0.0
+                len(predicted) == 1
+                and bool(
+                    torch.isclose(
+                        target[predicted[0]],
+                        target.max(),
+                        rtol=0.0,
+                        atol=1e-8,
+                    )
+                )
             )
         else:
             target = batch["action_mask"][row, :option_count]
@@ -181,18 +195,61 @@ def train(args: argparse.Namespace) -> tuple[PolicyValueModel, list[EpochMetrics
     }.get(data_version)
     if inferred_model_type is None:
         raise ValueError(f"Unsupported encoder version: {data_version}")
-    model_type = inferred_model_type if args.model_type == "auto" else args.model_type
     expected_model_type = {
         1: "mlp_v1",
         2: "transformer_v2",
         3: "transformer_v3",
     }[data_version]
-    if model_type != expected_model_type:
-        raise ValueError(f"{model_type} is incompatible with encoder V{data_version} data")
-    if model_type != "transformer_v3" and (
-        args.disable_card_semantics or args.disable_history
-    ):
-        raise ValueError("V3 ablation flags require encoder V3 training data")
+    initial_state: dict[str, torch.Tensor] | None = None
+    if args.initialize_from is not None:
+        saved = torch.load(args.initialize_from, map_location="cpu", weights_only=False)
+        if not isinstance(saved, dict) or not isinstance(saved.get("model_config"), dict):
+            raise TypeError("Initialization checkpoint must contain model_config")
+        if not isinstance(saved.get("model_state_dict"), dict):
+            raise TypeError("Initialization checkpoint must contain model_state_dict")
+        model_config = dict(saved["model_config"])
+        model_type = str(model_config.get("model_type"))
+        initial_state = saved["model_state_dict"]
+        if model_type != expected_model_type:
+            raise ValueError(
+                f"Initialization checkpoint {model_type} is incompatible with "
+                f"encoder V{data_version} data"
+            )
+        if has_multiselect and action_space_version(model_config) < 2:
+            raise ValueError(
+                "Initialization checkpoint does not support multiselect training examples"
+            )
+    else:
+        model_type = inferred_model_type if args.model_type == "auto" else args.model_type
+        if model_type != expected_model_type:
+            raise ValueError(f"{model_type} is incompatible with encoder V{data_version} data")
+        if model_type != "transformer_v3" and (
+            args.disable_card_semantics or args.disable_history
+        ):
+            raise ValueError("V3 ablation flags require encoder V3 training data")
+        model_config = {
+            "model_type": model_type,
+            "hidden_size": args.hidden_size,
+            "value_bins": args.value_bins,
+            "action_space_version": 2 if has_multiselect else 1,
+        }
+        if model_type in {"transformer_v2", "transformer_v3"}:
+            model_config.update(
+                {
+                    "num_layers": args.num_layers,
+                    "num_heads": args.num_heads,
+                    "dropout": args.dropout,
+                    "card_vocab_size": args.card_vocab_size,
+                    "attack_vocab_size": args.attack_vocab_size,
+                }
+            )
+        if model_type == "transformer_v3":
+            model_config.update(
+                {
+                    "use_card_semantics": not args.disable_card_semantics,
+                    "use_history": not args.disable_history,
+                }
+            )
     train_data, validation_data = split_by_game(dataset, args.validation_fraction, args.seed)
     if data_version in {2, 3}:
         train_loader = DataLoader(
@@ -223,30 +280,9 @@ def train(args: argparse.Namespace) -> tuple[PolicyValueModel, list[EpochMetrics
             collate_fn=collate_bc,
         )
     device = resolve_device(args.device)
-    model_config = {
-        "model_type": model_type,
-        "hidden_size": args.hidden_size,
-        "value_bins": args.value_bins,
-        "action_space_version": 2 if has_multiselect else 1,
-    }
-    if model_type in {"transformer_v2", "transformer_v3"}:
-        model_config.update(
-            {
-                "num_layers": args.num_layers,
-                "num_heads": args.num_heads,
-                "dropout": args.dropout,
-                "card_vocab_size": args.card_vocab_size,
-                "attack_vocab_size": args.attack_vocab_size,
-            }
-        )
-    if model_type == "transformer_v3":
-        model_config.update(
-            {
-                "use_card_semantics": not args.disable_card_semantics,
-                "use_history": not args.disable_history,
-            }
-        )
     model = build_model(model_config).to(device)
+    if initial_state is not None:
+        model.load_state_dict(initial_state)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-4)
     history: list[EpochMetrics] = []
     best_validation_loss = float("inf")
@@ -306,6 +342,11 @@ def train(args: argparse.Namespace) -> tuple[PolicyValueModel, list[EpochMetrics
             "validation_examples": len(validation_data),
             "selected_epoch": best_epoch,
             "selection_metric": "validation_loss",
+            "initialized_from": (
+                str(args.initialize_from.expanduser().resolve())
+                if args.initialize_from is not None
+                else None
+            ),
         },
         args.output,
     )
@@ -316,6 +357,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train policy/value heads from RuleAgent data.")
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--initialize-from",
+        type=Path,
+        help="Fine-tune an existing compatible policy/value checkpoint.",
+    )
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
