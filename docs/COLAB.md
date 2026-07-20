@@ -88,7 +88,20 @@ W&B adds `reward/mean_abs_shaping_reward` and `reward/mean_shaping_return`. The 
 positive when prize counts change; with `gamma=1`, the latter should remain close to zero across
 many games because potential differences telescope. Use the same starting checkpoint and seed with
 `POKETCG_REWARD_SHAPING=none` for a controlled A/B comparison. The script also accepts
-`POKETCG_ITERATIONS` and `POKETCG_GAMES_PER_ITERATION` overrides.
+`POKETCG_ITERATIONS`, `POKETCG_GAMES_PER_ITERATION`, and `POKETCG_LEARNING_RATE` overrides.
+
+Add one fixed historical policy to the population without expanding the full Python command:
+
+```bash
+POKETCG_POOL_CHECKPOINT=/content/drive/MyDrive/pokemonTCG/checkpoints/OLD_POLICY.pt \
+POKETCG_POOL_CHECKPOINT_WEIGHT=0.35 \
+POKETCG_LEARNING_RATE=0.00003 \
+WANDB_RUN_NAME=ppo-v3-actions-v2-vs-old-policy \
+bash scripts/train_colab_ppo.sh INPUT.pt OUTPUT.pt
+```
+
+If `POKETCG_POOL_CHECKPOINT` is unset, no extra historical checkpoint is added and the script keeps
+its previous behavior. A configured path is validated before training starts.
 
 ## Decoupled actor and critic lambda
 

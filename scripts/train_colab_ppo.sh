@@ -10,10 +10,13 @@ ROLLOUT_DEVICE="${POKETCG_ROLLOUT_DEVICE:-cpu}"
 ROLLOUT_WORKERS="${POKETCG_ROLLOUT_WORKERS:-8}"
 ITERATIONS="${POKETCG_ITERATIONS:-40}"
 GAMES_PER_ITERATION="${POKETCG_GAMES_PER_ITERATION:-512}"
+LEARNING_RATE="${POKETCG_LEARNING_RATE:-0.00005}"
 GAE_LAMBDA="${POKETCG_GAE_LAMBDA:-0.95}"
 VALUE_GAE_LAMBDA="${POKETCG_VALUE_GAE_LAMBDA:-0.95}"
 REWARD_SHAPING="${POKETCG_REWARD_SHAPING:-none}"
 REWARD_SHAPING_SCALE="${POKETCG_REWARD_SHAPING_SCALE:-1.0}"
+POOL_CHECKPOINT="${POKETCG_POOL_CHECKPOINT:-}"
+POOL_CHECKPOINT_WEIGHT="${POKETCG_POOL_CHECKPOINT_WEIGHT:-0.35}"
 WANDB_MODE="${WANDB_MODE:-online}"
 WANDB_PROJECT="${WANDB_PROJECT:-pokemon-tcg-ai-battle}"
 WANDB_RUN_NAME="${WANDB_RUN_NAME:-ppo-v2-parallel-8w}"
@@ -22,6 +25,11 @@ WANDB_ENTITY="${WANDB_ENTITY:-}"
 if [[ ! -f "$INPUT_CHECKPOINT" ]]; then
   echo "Missing input checkpoint: $INPUT_CHECKPOINT" >&2
   exit 2
+fi
+
+if [[ -n "$POOL_CHECKPOINT" && ! -f "$POOL_CHECKPOINT" ]]; then
+  echo "Missing pool checkpoint: $POOL_CHECKPOINT" >&2
+  exit 4
 fi
 
 mkdir -p "$(dirname "$OUTPUT_CHECKPOINT")"
@@ -40,6 +48,14 @@ if [[ -n "$WANDB_ENTITY" ]]; then
   WANDB_ARGS+=(--wandb-entity "$WANDB_ENTITY")
 fi
 
+POOL_ARGS=()
+if [[ -n "$POOL_CHECKPOINT" ]]; then
+  POOL_ARGS+=(
+    --pool-checkpoint "$POOL_CHECKPOINT"
+    --pool-checkpoint-weight "$POOL_CHECKPOINT_WEIGHT"
+  )
+fi
+
 python -c 'import torch; assert torch.cuda.is_available(), "CUDA GPU is not available"; print(torch.cuda.get_device_name(0))'
 
 python -m poketcg.rl.train_ppo \
@@ -49,7 +65,7 @@ python -m poketcg.rl.train_ppo \
   --games-per-iteration "$GAMES_PER_ITERATION" \
   --ppo-epochs 4 \
   --batch-size 512 \
-  --learning-rate 0.00005 \
+  --learning-rate "$LEARNING_RATE" \
   --gamma 1.0 \
   --gae-lambda "$GAE_LAMBDA" \
   --value-gae-lambda "$VALUE_GAE_LAMBDA" \
@@ -73,4 +89,5 @@ python -m poketcg.rl.train_ppo \
   --adaptive-warmup-games 64 \
   --checkpoint-every 2 \
   --seed 20260721 \
+  "${POOL_ARGS[@]}" \
   "${WANDB_ARGS[@]}"
