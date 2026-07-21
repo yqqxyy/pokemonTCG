@@ -143,6 +143,8 @@ def test_mcts_aggregates_independent_determinization_trees() -> None:
     assert agent.last_search["determinizations"] == 4
     assert agent.last_search["simulations"] == 64
     assert agent.metrics()["determinizations"] == 4
+    assert agent.metrics()["p95_elapsed_ms"] >= 0.0
+    assert agent.metrics()["p99_elapsed_ms"] >= agent.metrics()["p95_elapsed_ms"]
 
 
 def test_deck_determinizer_fills_every_hidden_zone() -> None:

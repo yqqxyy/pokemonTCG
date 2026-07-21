@@ -6,7 +6,7 @@ import importlib
 import itertools
 import math
 import random
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import asdict, dataclass, field
 from time import perf_counter
 from typing import Any, Protocol
@@ -486,6 +486,9 @@ class PolicyValueMCTSAgent:
         self._total_determinizations = 0
         self._deepest = 0
         self._opponent_deck_samples: Counter[str] = Counter()
+        # Keep enough samples for panel percentiles without growing forever in
+        # long-running submission processes.
+        self._elapsed_samples_ms: deque[float] = deque(maxlen=50_000)
 
     def reset_episode(self) -> None:
         """Clear stateful opponent evidence before a new battle."""
@@ -493,6 +496,17 @@ class PolicyValueMCTSAgent:
 
     def metrics(self) -> dict[str, Any]:
         searches = max(self._search_count, 1)
+
+        def percentile(fraction: float) -> float:
+            if not self._elapsed_samples_ms:
+                return 0.0
+            ordered = sorted(self._elapsed_samples_ms)
+            position = fraction * (len(ordered) - 1)
+            lower = int(position)
+            upper = min(lower + 1, len(ordered) - 1)
+            weight = position - lower
+            return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
         return {
             "searches": self._search_count,
             "simulations": self._total_simulations,
@@ -500,6 +514,10 @@ class PolicyValueMCTSAgent:
             "nodes": self._total_nodes,
             "mean_nodes_per_search": round(self._total_nodes / searches, 3),
             "mean_elapsed_ms": round(self._total_elapsed_ms / searches, 3),
+            "p50_elapsed_ms": round(percentile(0.50), 3),
+            "p95_elapsed_ms": round(percentile(0.95), 3),
+            "p99_elapsed_ms": round(percentile(0.99), 3),
+            "max_elapsed_ms": round(max(self._elapsed_samples_ms, default=0.0), 3),
             "max_depth_reached": self._deepest,
             "opponent_deck_samples": dict(sorted(self._opponent_deck_samples.items())),
         }
@@ -702,6 +720,7 @@ class PolicyValueMCTSAgent:
         self.last_search = stats
         self._search_count += 1
         self._total_elapsed_ms += float(stats["elapsed_ms"])
+        self._elapsed_samples_ms.append(float(stats["elapsed_ms"]))
         self._total_nodes += int(stats["nodes"])
         self._total_simulations += int(stats["simulations"])
         self._total_determinizations += int(stats["determinizations"])
