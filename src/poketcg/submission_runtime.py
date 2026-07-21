@@ -23,6 +23,8 @@ _ROOT = _find_agent_root()
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 _POLICY: Any | None = None
+_PLANNER: Any | None = None
+_HYBRID: Any | None = None
 _MCTS: Any | None = None
 _RULE_AGENT: Any | None = None
 _POLICY_DISABLED = False
@@ -101,9 +103,54 @@ def _get_rule_agent() -> Any | None:
     return _RULE_AGENT
 
 
+def _get_planner() -> Any | None:
+    global _PLANNER
+    if _PLANNER is not None:
+        return _PLANNER
+    try:
+        from poketcg.agents import TacticalPlannerAgent
+
+        cards, attacks = _catalogs()
+        _PLANNER = TacticalPlannerAgent(
+            card_catalog=cards,
+            attack_catalog=attacks,
+            seed=20260720,
+        )
+    except Exception:
+        traceback.print_exc()
+    return _PLANNER
+
+
+def _get_hybrid() -> Any | None:
+    global _HYBRID
+    if _HYBRID is not None:
+        return _HYBRID
+    try:
+        from poketcg.agents import PlannerPolicyAgent
+
+        policy = _get_policy()
+        planner = _get_planner()
+        if policy is None or planner is None:
+            raise RuntimeError("Planner-policy components failed to initialize")
+        settings = _CONFIG.get("planner") or {}
+        _HYBRID = PlannerPolicyAgent(
+            policy,
+            planner,
+            planner_threshold=float(settings.get("threshold", 0.8)),
+            planner_weight=float(settings.get("weight", 4.0)),
+            confidence_routing=bool(settings.get("confidence_routing", True)),
+            deterministic=False,
+            seed=20260721,
+        )
+    except Exception:
+        traceback.print_exc()
+    return _HYBRID
+
+
 def _get_mcts() -> Any | None:
     global _MCTS, _MCTS_DISABLED, _MCTS_ERROR_REPORTED
-    if _CONFIG.get("mode") != "mcts":
+    mode = _CONFIG.get("mode")
+    if mode not in {"mcts", "planner-mcts"}:
         return None
     if _MCTS is not None:
         return _MCTS
@@ -113,7 +160,7 @@ def _get_mcts() -> Any | None:
     try:
         from poketcg.mcts import DeckDeterminizer, MCTSConfig, PolicyValueMCTSAgent
 
-        policy = _get_policy()
+        policy = _get_hybrid() if mode == "planner-mcts" else _get_policy()
         if policy is None:
             raise RuntimeError("MCTS policy failed to initialize")
         cards, _ = _catalogs()
@@ -166,6 +213,10 @@ def agent(obs_dict: dict) -> list[int]:
     if obs_dict.get("select") is None:
         if _MCTS is not None:
             _MCTS.reset_episode()
+        if _HYBRID is not None:
+            _HYBRID.reset_episode()
+        elif _PLANNER is not None:
+            _PLANNER.reset_episode()
         return _read_deck()
 
     mcts = _get_mcts()
@@ -174,6 +225,22 @@ def agent(obs_dict: dict) -> list[int]:
             return mcts.choose_action(obs_dict)
         except Exception:
             traceback.print_exc()
+
+    mode = _CONFIG.get("mode")
+    if mode == "planner":
+        planner = _get_planner()
+        if planner is not None:
+            try:
+                return planner.choose_action(obs_dict)
+            except Exception:
+                traceback.print_exc()
+    elif mode in {"planner-policy", "planner-mcts"}:
+        hybrid = _get_hybrid()
+        if hybrid is not None:
+            try:
+                return hybrid.choose_action(obs_dict)
+            except Exception:
+                traceback.print_exc()
 
     policy = _get_policy()
     if policy is not None:

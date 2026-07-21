@@ -75,6 +75,31 @@ def test_build_submission_records_mcts_runtime_config(tmp_path: Path) -> None:
         assert json.load(config_file) == result["agent_config"]
 
 
+def test_build_submission_records_planner_mcts_runtime_config(tmp_path: Path) -> None:
+    official = _fake_official_dir(tmp_path)
+    checkpoint = tmp_path / "model.pt"
+    torch.save({"model_config": {}, "model_state_dict": {}}, checkpoint)
+
+    result = build_submission(
+        checkpoint,
+        tmp_path / "submission.tar.gz",
+        official_dir=official,
+        tactical_planner=True,
+        planner_threshold=0.85,
+        planner_weight=2.5,
+        mcts_simulations=8,
+    )
+
+    assert result["agent_config"]["mode"] == "planner-mcts"
+    assert result["agent_config"]["planner"] == {
+        "enabled": True,
+        "threshold": 0.85,
+        "weight": 2.5,
+        "confidence_routing": True,
+        "profile": "mega-lucario-ex",
+    }
+
+
 def test_build_submission_rejects_invalid_deck(tmp_path: Path) -> None:
     official = _fake_official_dir(tmp_path)
     (official / "deck.csv").write_text("1\n2\n", encoding="utf-8")

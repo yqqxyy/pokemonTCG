@@ -15,7 +15,14 @@ from typing import Any
 
 import torch
 
-from poketcg.agents import BCPolicyAgent, ExternalPythonAgent, RandomAgent, RuleAgent
+from poketcg.agents import (
+    BCPolicyAgent,
+    ExternalPythonAgent,
+    PlannerPolicyAgent,
+    RandomAgent,
+    RuleAgent,
+    TacticalPlannerAgent,
+)
 from poketcg.engine import OfficialEngine
 from poketcg.match import MatchResult, play_match
 from poketcg.mcts import (
@@ -64,6 +71,9 @@ class PanelTask:
     torch_threads: int
     mcts_prior: str
     mcts_config: MCTSConfig
+    planner_threshold: float
+    planner_weight: float
+    planner_confidence_routing: bool
 
 
 def _named_path(specification: str, option: str) -> tuple[str, Path]:
@@ -162,6 +172,17 @@ def _search_metrics(agent: Any) -> dict[str, Any] | None:
     return None
 
 
+def _policy_metrics(agent: Any) -> dict[str, Any] | None:
+    if isinstance(agent, PlannerPolicyAgent):
+        return agent.metrics()
+    policy = getattr(agent, "_policy", agent)
+    if isinstance(policy, PlannerPolicyAgent):
+        return policy.metrics()
+    if isinstance(agent, TacticalPlannerAgent):
+        return agent.metrics()
+    return None
+
+
 def _build_agent(
     specification: AgentSpec,
     *,
@@ -175,11 +196,20 @@ def _build_agent(
     stochastic: bool,
     mcts_prior: str,
     mcts_config: MCTSConfig,
+    planner_threshold: float,
+    planner_weight: float,
+    planner_confidence_routing: bool,
 ) -> Any:
     if specification.kind == "random":
         return RandomAgent(seed)
     if specification.kind == "rule":
         return RuleAgent(
+            card_catalog=card_catalog,
+            attack_catalog=attack_catalog,
+            seed=seed,
+        )
+    if specification.kind == "planner":
+        return TacticalPlannerAgent(
             card_catalog=card_catalog,
             attack_catalog=attack_catalog,
             seed=seed,
@@ -206,7 +236,23 @@ def _build_agent(
     )
     if specification.kind == "policy":
         return policy
-    if specification.kind != "mcts":
+    if specification.kind in {"planner-policy", "planner-mcts"}:
+        policy = PlannerPolicyAgent(
+            policy,
+            TacticalPlannerAgent(
+                card_catalog=card_catalog,
+                attack_catalog=attack_catalog,
+                seed=seed + 200_000,
+            ),
+            planner_threshold=planner_threshold,
+            planner_weight=planner_weight,
+            confidence_routing=planner_confidence_routing,
+            deterministic=not stochastic,
+            seed=seed + 250_000,
+        )
+        if specification.kind == "planner-policy":
+            return policy
+    elif specification.kind != "mcts":
         raise ValueError(f"Unknown agent kind: {specification.kind}")
 
     opponent = 1 - player
@@ -272,6 +318,9 @@ def _run_cell(task: PanelTask) -> dict[str, Any]:
             stochastic=task.stochastic,
             mcts_prior=task.mcts_prior,
             mcts_config=task.mcts_config,
+            planner_threshold=task.planner_threshold,
+            planner_weight=task.planner_weight,
+            planner_confidence_routing=task.planner_confidence_routing,
         )
         opponent_player = 1 - candidate_player
         opponent = _build_agent(
@@ -286,6 +335,9 @@ def _run_cell(task: PanelTask) -> dict[str, Any]:
             stochastic=task.stochastic,
             mcts_prior=task.mcts_prior,
             mcts_config=task.mcts_config,
+            planner_threshold=task.planner_threshold,
+            planner_weight=task.planner_weight,
+            planner_confidence_routing=task.planner_confidence_routing,
         )
         results: list[tuple[MatchResult, int]] = []
         for game in range(task.games_per_seat):
@@ -311,10 +363,16 @@ def _run_cell(task: PanelTask) -> dict[str, Any]:
         seat = _summary(results)
         candidate_search = _search_metrics(candidate)
         opponent_search = _search_metrics(opponent)
+        candidate_policy = _policy_metrics(candidate)
+        opponent_policy = _policy_metrics(opponent)
         if candidate_search is not None:
             seat["candidate_search"] = candidate_search
         if opponent_search is not None:
             seat["opponent_search"] = opponent_search
+        if candidate_policy is not None:
+            seat["candidate_policy"] = candidate_policy
+        if opponent_policy is not None:
+            seat["opponent_policy"] = opponent_policy
         seats[f"as_player{candidate_player}"] = seat
 
     return {
@@ -471,12 +529,19 @@ def evaluate_meta_panel(
     c_puct: float = 1.25,
     max_depth: int = 12,
     max_actions: int = 16,
+    planner_threshold: float = 0.8,
+    planner_weight: float = 4.0,
+    planner_confidence_routing: bool = True,
     progress: bool = False,
 ) -> dict[str, Any]:
     if games_per_seat <= 0:
         raise ValueError("games_per_seat must be positive")
     if workers <= 0 or torch_threads <= 0:
         raise ValueError("workers and torch_threads must be positive")
+    if not 0.0 <= planner_threshold <= 1.0:
+        raise ValueError("planner_threshold must be in [0, 1]")
+    if planner_weight < 0:
+        raise ValueError("planner_weight must be non-negative")
     if not candidates or not opponents or not opponent_decks:
         raise ValueError("candidates, opponents, and opponent_decks cannot be empty")
     if len(candidates) != len(set(candidates)):
@@ -537,6 +602,9 @@ def evaluate_meta_panel(
                         torch_threads=torch_threads,
                         mcts_prior=mcts_prior,
                         mcts_config=mcts_config,
+                        planner_threshold=planner_threshold,
+                        planner_weight=planner_weight,
+                        planner_confidence_routing=planner_confidence_routing,
                     )
                 )
 
@@ -577,6 +645,9 @@ def evaluate_meta_panel(
         "torch_threads_per_worker": torch_threads,
         "mcts_prior": mcts_prior,
         "mcts_config": asdict(mcts_config),
+        "planner_threshold": planner_threshold,
+        "planner_weight": planner_weight,
+        "planner_confidence_routing": planner_confidence_routing,
         "candidates": [asdict(item) for item in candidate_specs],
         "opponents": [asdict(item) for item in opponents],
         "opponent_decks": [asdict(item) for item in opponent_decks],
@@ -607,7 +678,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--candidate",
         action="append",
-        choices=("policy", "mcts"),
+        choices=("policy", "mcts", "planner", "planner-policy", "planner-mcts"),
         help="Repeat to select candidates; defaults to policy and mcts.",
     )
     parser.add_argument(
@@ -660,6 +731,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--c-puct", type=float, default=1.25)
     parser.add_argument("--max-depth", type=int, default=12)
     parser.add_argument("--max-actions", type=int, default=16)
+    parser.add_argument("--planner-threshold", type=float, default=0.8)
+    parser.add_argument("--planner-weight", type=float, default=4.0)
+    confidence_group = parser.add_mutually_exclusive_group()
+    confidence_group.add_argument(
+        "--planner-confidence-routing",
+        dest="planner_confidence_routing",
+        action="store_true",
+        default=True,
+    )
+    confidence_group.add_argument(
+        "--no-planner-confidence-routing",
+        dest="planner_confidence_routing",
+        action="store_false",
+    )
     parser.add_argument("--output", type=Path, required=True)
     return parser
 
@@ -732,6 +817,9 @@ def main(argv: list[str] | None = None) -> int:
         c_puct=args.c_puct,
         max_depth=args.max_depth,
         max_actions=args.max_actions,
+        planner_threshold=args.planner_threshold,
+        planner_weight=args.planner_weight,
+        planner_confidence_routing=args.planner_confidence_routing,
         progress=True,
     )
     rendered = json.dumps(result, indent=2, ensure_ascii=False)

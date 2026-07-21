@@ -70,6 +70,11 @@ def build_submission(
     mcts_c_puct: float = 1.25,
     mcts_max_depth: int = 12,
     mcts_max_actions: int = 16,
+    tactical_planner: bool = False,
+    planner_only: bool = False,
+    planner_threshold: float = 0.8,
+    planner_weight: float = 4.0,
+    planner_confidence_routing: bool = True,
 ) -> dict[str, Any]:
     """Create and validate a root-layout ``submission.tar.gz`` archive."""
     checkpoint_path = Path(checkpoint).expanduser().resolve()
@@ -92,8 +97,32 @@ def build_submission(
         raise ValueError("mcts_c_puct must be non-negative")
     if mcts_max_depth <= 0 or mcts_max_actions <= 0:
         raise ValueError("MCTS depth and action limits must be positive")
+    if not 0.0 <= planner_threshold <= 1.0:
+        raise ValueError("planner_threshold must be in [0, 1]")
+    if planner_weight < 0:
+        raise ValueError("planner_weight must be non-negative")
+    planner_enabled = tactical_planner or planner_only
+    if planner_only and mcts_simulations:
+        raise ValueError("planner_only cannot be combined with MCTS")
+    if planner_only:
+        mode = "planner"
+    elif planner_enabled and mcts_simulations:
+        mode = "planner-mcts"
+    elif planner_enabled:
+        mode = "planner-policy"
+    elif mcts_simulations:
+        mode = "mcts"
+    else:
+        mode = "policy"
     agent_config = {
-        "mode": "mcts" if mcts_simulations else "policy",
+        "mode": mode,
+        "planner": {
+            "enabled": planner_enabled,
+            "threshold": planner_threshold,
+            "weight": planner_weight,
+            "confidence_routing": planner_confidence_routing,
+            "profile": "mega-lucario-ex",
+        },
         "mcts": {
             "simulations": mcts_simulations,
             "determinizations": mcts_determinizations,
@@ -164,6 +193,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mcts-c-puct", type=float, default=1.25)
     parser.add_argument("--mcts-max-depth", type=int, default=12)
     parser.add_argument("--mcts-max-actions", type=int, default=16)
+    parser.add_argument(
+        "--tactical-planner",
+        action="store_true",
+        help="Blend the Mega Lucario tactical planner with policy/MCTS decisions.",
+    )
+    parser.add_argument(
+        "--planner-only",
+        action="store_true",
+        help="Build the planner-only ablation instead of using the neural policy.",
+    )
+    parser.add_argument("--planner-threshold", type=float, default=0.8)
+    parser.add_argument("--planner-weight", type=float, default=4.0)
+    confidence_group = parser.add_mutually_exclusive_group()
+    confidence_group.add_argument(
+        "--planner-confidence-routing",
+        dest="planner_confidence_routing",
+        action="store_true",
+        default=True,
+    )
+    confidence_group.add_argument(
+        "--no-planner-confidence-routing",
+        dest="planner_confidence_routing",
+        action="store_false",
+    )
     return parser
 
 
@@ -179,6 +232,11 @@ def main(argv: list[str] | None = None) -> int:
         mcts_c_puct=args.mcts_c_puct,
         mcts_max_depth=args.mcts_max_depth,
         mcts_max_actions=args.mcts_max_actions,
+        tactical_planner=args.tactical_planner,
+        planner_only=args.planner_only,
+        planner_threshold=args.planner_threshold,
+        planner_weight=args.planner_weight,
+        planner_confidence_routing=args.planner_confidence_routing,
     )
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0

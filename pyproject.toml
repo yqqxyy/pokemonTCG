@@ -36,6 +36,7 @@ poketcg-evaluate-meta = "poketcg.rl.evaluate_meta_panel:main"
 poketcg-collect-expert = "poketcg.rl.collect_expert_iteration:main"
 poketcg-collect-external-expert = "poketcg.rl.collect_external_expert:main"
 poketcg-collect-dagger = "poketcg.rl.collect_dagger:main"
+poketcg-planner-diagnostics = "poketcg.rl.planner_diagnostics:main"
 poketcg-build-submission = "poketcg.submission:main"
 
 
