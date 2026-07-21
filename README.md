@@ -503,6 +503,48 @@ python -m poketcg.rl.train_bc \
 升至 40% 以上才说明蒸馏获得了实质效果；接近 50% 表示大部分专家策略已经复现。之后再把新
 checkpoint 作为 MCTS prior，判断搜索是否终于建立在有效策略之上。
 
+## DAgger：在学生访问的状态上查询专家
+
+普通 offline BC 只覆盖专家自己访问的状态。`collect_dagger` 让学生实际参与对局，同时在学生
+一方的每个决策上调用一个影子 Mega Lucario 专家，并把“学生状态、专家动作”写入数据。影子
+专家也会收到 forced selection，因此其跨决策的 `plan` 和 `ability_used` 能持续更新；只有学生
+可学习的决策才进入 JSONL。动作以概率 `beta` 执行专家动作，否则执行学生动作。
+
+Round 1 使用蒸馏模型、`beta=0.5` 和 600 局，三类对手 × 双座位各 100 局：
+
+```bash
+python -m poketcg.rl.collect_dagger \
+  --student-checkpoint /content/drive/MyDrive/pokemonTCG/checkpoints/mega_lucario_distilled_round1.pt \
+  --expert-source /content/drive/MyDrive/pokemonTCG/public_agents/mega_lucario/a-sample-rule-based-agent-mega-lucario-ex-deck.ipynb \
+  --expert-deck /content/drive/MyDrive/pokemonTCG/public_agents/mega_lucario/deck.csv \
+  --opponent rule --opponent policy --opponent mirror \
+  --beta 0.5 --games 600 --workers 8 --torch-threads 1 \
+  --seed 20260824 \
+  --output /content/drive/MyDrive/pokemonTCG/expert_distillation/mega_dagger_round1_beta050_600.jsonl
+```
+
+采集摘要中的 `realized_beta` 应接近 0.5；`disagreement_rate` 是学生与专家在学生状态上的动作
+分歧率，是后续轮次是否仍有新信息的核心指标。对局胜率包含专家干预，不能作为学生自身胜率。
+
+以 DAgger 数据为主数据，同时 replay 原始专家轨迹和 Rule BC。Value target 来自混合执行策略，
+所以这一轮降低 Value loss 权重，主要学习 Policy：
+
+```bash
+python -m poketcg.rl.train_bc \
+  --input /content/drive/MyDrive/pokemonTCG/expert_distillation/mega_dagger_round1_beta050_600.jsonl \
+  --replay-input /content/drive/MyDrive/pokemonTCG/expert_distillation/mega_lucario_expert_v3_1200.jsonl \
+  --replay-input /content/drive/MyDrive/pokemonTCG/bc/rule_v3_semantic_actions_v2_2000.jsonl \
+  --replay-fraction 0.5 \
+  --initialize-from /content/drive/MyDrive/pokemonTCG/checkpoints/mega_lucario_distilled_round1.pt \
+  --output /content/drive/MyDrive/pokemonTCG/checkpoints/mega_dagger_round1.pt \
+  --epochs 4 --batch-size 128 --learning-rate 0.00002 \
+  --value-coefficient 0.05 --max-grad-norm 0.5 \
+  --device cuda --seed 20260824
+```
+
+Round 1 必须用 `--deterministic` 做 Mega 镜像 Policy 评测。若有提升，再依次用新 checkpoint
+采集 `beta=0.25` 和 `beta=0.10`；每轮都聚合历史 DAgger 数据，而不是覆盖旧数据。
+
 ## Expert Iteration：蒸馏 MCTS
 
 `collect_expert_iteration` 运行当前 checkpoint 的 MCTS self-play。MAIN 根节点使用搜索子节点
