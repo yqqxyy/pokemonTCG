@@ -6,7 +6,7 @@ import argparse
 import json
 import math
 import random
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import torch
@@ -14,7 +14,7 @@ from torch import nn
 from torch.utils.data import DataLoader, Sampler
 
 from .action_space import batch_subset_log_probabilities, deterministic_subset
-from .data import BCDataset, collate_bc
+from .data import BCDataset, BCExample, collate_bc
 from .model import (
     PolicyValueModel,
     action_space_version,
@@ -177,9 +177,70 @@ def split_by_game(dataset: BCDataset, validation_fraction: float, seed: int):
     return BCDataset(train), BCDataset(validation)
 
 
+def load_training_dataset(
+    input_path: str | Path,
+    *,
+    replay_paths: list[str | Path] | None = None,
+    replay_fraction: float = 0.0,
+    seed: int = 42,
+) -> tuple[BCDataset, dict[str, int | float | list[str]]]:
+    """Mix a primary expert dataset with a controlled amount of old BC replay."""
+    if not 0.0 <= replay_fraction < 1.0:
+        raise ValueError("replay_fraction must be in [0, 1)")
+    resolved_input = Path(input_path).expanduser().resolve()
+    primary = BCDataset.from_jsonl(resolved_input)
+    paths = [Path(path).expanduser().resolve() for path in replay_paths or []]
+    if replay_fraction > 0.0 and not paths:
+        raise ValueError("A positive replay_fraction requires at least one replay dataset")
+    if paths and replay_fraction == 0.0:
+        raise ValueError("Replay datasets require a positive replay_fraction")
+
+    selected_replay: list[BCExample] = []
+    if paths:
+        replay_examples: list[BCExample] = []
+        game_offset = max((example.game for example in primary.examples), default=-1) + 1
+        for path in paths:
+            replay = BCDataset.from_jsonl(path)
+            source_games = sorted({example.game for example in replay.examples})
+            game_mapping = {
+                game: game_offset + index for index, game in enumerate(source_games)
+            }
+            replay_examples.extend(
+                replace(example, game=game_mapping[example.game])
+                for example in replay.examples
+            )
+            game_offset += len(source_games)
+        if not replay_examples:
+            raise ValueError("Replay datasets contain no examples")
+        target_count = round(len(primary) * replay_fraction / (1.0 - replay_fraction))
+        generator = random.Random(seed)
+        if target_count <= len(replay_examples):
+            selected_replay = generator.sample(replay_examples, target_count)
+        else:
+            selected_replay = generator.choices(replay_examples, k=target_count)
+
+    combined = BCDataset([*primary.examples, *selected_replay])
+    summary: dict[str, int | float | list[str]] = {
+        "primary_examples": len(primary),
+        "replay_examples": len(selected_replay),
+        "total_examples": len(combined),
+        "requested_replay_fraction": replay_fraction,
+        "actual_replay_fraction": (
+            round(len(selected_replay) / len(combined), 6) if len(combined) else 0.0
+        ),
+        "replay_inputs": [str(path) for path in paths],
+    }
+    return combined, summary
+
+
 def train(args: argparse.Namespace) -> tuple[PolicyValueModel, list[EpochMetrics]]:
     torch.manual_seed(args.seed)
-    dataset = BCDataset.from_jsonl(args.input)
+    dataset, dataset_summary = load_training_dataset(
+        args.input,
+        replay_paths=getattr(args, "replay_input", None),
+        replay_fraction=getattr(args, "replay_fraction", 0.0),
+        seed=args.seed,
+    )
     data_versions = {example.decision.version for example in dataset.examples}
     if len(data_versions) != 1:
         raise ValueError("Training data cannot mix encoder versions")
@@ -347,6 +408,7 @@ def train(args: argparse.Namespace) -> tuple[PolicyValueModel, list[EpochMetrics
                 if args.initialize_from is not None
                 else None
             ),
+            "dataset_summary": dataset_summary,
         },
         args.output,
     )
@@ -356,6 +418,18 @@ def train(args: argparse.Namespace) -> tuple[PolicyValueModel, list[EpochMetrics
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train policy/value heads from RuleAgent data.")
     parser.add_argument("--input", type=Path, required=True)
+    parser.add_argument(
+        "--replay-input",
+        type=Path,
+        action="append",
+        help="Old compatible BC data to replay; repeat to combine datasets.",
+    )
+    parser.add_argument(
+        "--replay-fraction",
+        type=float,
+        default=0.0,
+        help="Target fraction of replay examples in the combined training data.",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
         "--initialize-from",

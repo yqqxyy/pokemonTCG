@@ -34,6 +34,7 @@ poketcg-evaluate-panel = "poketcg.rl.evaluate_panel:main"
 poketcg-evaluate-mcts = "poketcg.rl.evaluate_mcts:main"
 poketcg-evaluate-meta = "poketcg.rl.evaluate_meta_panel:main"
 poketcg-collect-expert = "poketcg.rl.collect_expert_iteration:main"
+poketcg-collect-external-expert = "poketcg.rl.collect_external_expert:main"
 poketcg-build-submission = "poketcg.submission:main"
 
 

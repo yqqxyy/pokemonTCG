@@ -441,6 +441,68 @@ python -m poketcg.rl.evaluate_meta_panel \
 只控制 Agent 与 determinization RNG，官方 native battle RNG 不能固定，因此差值仍是独立评测，
 不能当作严格 paired causal estimate。
 
+经过人工检查的公开 Kaggle Agent 可以保留在忽略的 `artifacts/public_agents` 下，通过
+`--external-opponent NAME=SOURCE,DECK` 接入；支持包含 `def agent(...)` 的 `.py`，以及用
+`%%writefile main.py` 生成提交代码的 `.ipynb`。外部 Agent 会绑定自己的牌组，不与其他 deck
+做无意义的交叉组合。Mega Lucario 官方样例的 50×2 screen：
+
+```bash
+python -m poketcg.rl.evaluate_meta_panel \
+  --checkpoint artifacts/checkpoints/ppo_v3_semantic_population_iter0018.pt \
+  --games-per-seat 50 --workers 1 --torch-threads 1 \
+  --candidate policy --candidate mcts --simulations 8 \
+  --external-opponent mega_lucario=artifacts/public_agents/mega_lucario/a-sample-rule-based-agent-mega-lucario-ex-deck.ipynb,artifacts/public_agents/mega_lucario/deck.csv \
+  --output results/mega_lucario_screen50.json
+```
+
+外部源码会在本机执行，因此必须先人工检查；本项目不复制或重新发布第三方 Agent 源码。若作者
+未声明许可证，只把它作为本地比赛评测依赖使用。
+
+## 外部专家策略蒸馏
+
+`collect_external_expert` 只记录经过人工检查的外部专家一方的 observation/action，并在对局结束
+后从专家视角回填 Value target。采集日程对每种对手轮换两个座位，避免把对手类型和先后手混在
+一起。每局都会重新执行一次专家源码，确保公开 Agent 保存在模块全局变量中的攻击计划不会泄漏
+到下一局。支持三种对手：通用 `rule`、当前 `policy` 和同一外部专家的 `mirror`。
+
+推荐从覆盖多选动作的 Actions V2 checkpoint 开始，让卡牌搜索、能量附着和弃牌选择也接受专家
+监督。V3 JSONL 约为每局 0.8 MB，Colab 8 CPU 的第一轮先采集 1200 局（每种对手、每个座位
+各 200 局），避免一开始产生约 5 GB 的 6000 局数据：
+
+```bash
+python -m poketcg.rl.collect_external_expert \
+  --expert-source artifacts/public_agents/mega_lucario/a-sample-rule-based-agent-mega-lucario-ex-deck.ipynb \
+  --expert-deck artifacts/public_agents/mega_lucario/deck.csv \
+  --opponent rule --opponent policy --opponent mirror \
+  --policy-checkpoint /content/drive/MyDrive/pokemonTCG/checkpoints/ppo_v3_actions_v2_best_response_iter0018_iter0006.pt \
+  --games 1200 --workers 8 --torch-threads 1 \
+  --encoder-version 3 --include-multiselect --seed 20260821 \
+  --output /content/drive/MyDrive/pokemonTCG/expert_distillation/mega_lucario_expert_v3_1200.jsonl
+```
+
+如果从旧 `ppo_v3_semantic_population_iter0018.pt` 开始，则必须去掉
+`--include-multiselect`，因为该 checkpoint 是 Action Space V1。采集器仍会执行专家的全部动作，
+但只保存 checkpoint 能学习的单选决策。
+
+从原 checkpoint 小学习率微调，并混入 25% 旧 Rule BC 样本以减轻只会 Mega 牌组的灾难性
+遗忘。主数据和 replay 数据必须使用相同 Encoder/Action Space 版本：
+
+```bash
+python -m poketcg.rl.train_bc \
+  --input /content/drive/MyDrive/pokemonTCG/expert_distillation/mega_lucario_expert_v3_1200.jsonl \
+  --replay-input /content/drive/MyDrive/pokemonTCG/bc/rule_v3_semantic_actions_v2_2000.jsonl \
+  --replay-fraction 0.25 \
+  --initialize-from /content/drive/MyDrive/pokemonTCG/checkpoints/ppo_v3_actions_v2_best_response_iter0018_iter0006.pt \
+  --output /content/drive/MyDrive/pokemonTCG/checkpoints/mega_lucario_distilled_round1.pt \
+  --epochs 5 --batch-size 128 --learning-rate 0.00003 \
+  --value-coefficient 0.1 --max-grad-norm 0.5 \
+  --device cuda --seed 20260821
+```
+
+第一验收项不是 Rule 胜率，而是相同 Mega Lucario 牌组下对原专家的镜像胜率。Policy 从约 27%
+升至 40% 以上才说明蒸馏获得了实质效果；接近 50% 表示大部分专家策略已经复现。之后再把新
+checkpoint 作为 MCTS prior，判断搜索是否终于建立在有效策略之上。
+
 ## Expert Iteration：蒸馏 MCTS
 
 `collect_expert_iteration` 运行当前 checkpoint 的 MCTS self-play。MAIN 根节点使用搜索子节点

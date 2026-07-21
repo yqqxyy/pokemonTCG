@@ -15,7 +15,7 @@ from typing import Any
 
 import torch
 
-from poketcg.agents import BCPolicyAgent, RandomAgent, RuleAgent
+from poketcg.agents import BCPolicyAgent, ExternalPythonAgent, RandomAgent, RuleAgent
 from poketcg.engine import OfficialEngine
 from poketcg.match import MatchResult, play_match
 from poketcg.mcts import (
@@ -44,6 +44,8 @@ class AgentSpec:
     name: str
     kind: str
     checkpoint: str | None = None
+    source: str | None = None
+    deck_path: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +76,26 @@ def _named_path(specification: str, option: str) -> tuple[str, Path]:
     if not name or not raw_path:
         raise ValueError(f"{option} must use non-empty NAME=PATH")
     return name, Path(raw_path).expanduser().resolve()
+
+
+def _external_opponent_spec(specification: str) -> AgentSpec:
+    try:
+        name, raw_paths = specification.split("=", 1)
+        raw_source, raw_deck = raw_paths.rsplit(",", 1)
+    except ValueError as error:
+        raise ValueError(
+            "--external-opponent must use NAME=SOURCE,DECK"
+        ) from error
+    name = name.strip()
+    source = Path(raw_source.strip()).expanduser().resolve()
+    deck = Path(raw_deck.strip()).expanduser().resolve()
+    if not name or not raw_source.strip() or not raw_deck.strip():
+        raise ValueError("--external-opponent must use non-empty NAME=SOURCE,DECK")
+    if not source.is_file():
+        raise FileNotFoundError(f"External agent source not found: {source}")
+    if not deck.is_file():
+        raise FileNotFoundError(f"External agent deck not found: {deck}")
+    return AgentSpec(name, "external", source=str(source), deck_path=str(deck))
 
 
 def _summary(results: list[tuple[MatchResult, int]]) -> dict[str, Any]:
@@ -161,6 +183,17 @@ def _build_agent(
             card_catalog=card_catalog,
             attack_catalog=attack_catalog,
             seed=seed,
+        )
+    if specification.kind == "external":
+        if specification.source is None or specification.deck_path is None:
+            raise ValueError(
+                f"External agent {specification.name!r} requires source and deck paths"
+            )
+        return ExternalPythonAgent(
+            specification.source,
+            specification.deck_path,
+            name=specification.name,
+            expected_deck=decks[player],
         )
     if specification.checkpoint is None:
         raise ValueError(f"Agent {specification.name!r} requires a checkpoint")
@@ -483,6 +516,11 @@ def evaluate_meta_panel(
     tasks = []
     for opponent_index, opponent in enumerate(opponents):
         for deck_index, opponent_deck in enumerate(opponent_decks):
+            if (
+                opponent.deck_path is not None
+                and Path(opponent.deck_path) != Path(opponent_deck.path)
+            ):
+                continue
             cell_seed = seed + opponent_index * 1_000_000 + deck_index * 100_000
             for candidate in candidate_specs:
                 tasks.append(
@@ -593,6 +631,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Add a fixed MCTS checkpoint opponent.",
     )
     parser.add_argument(
+        "--external-opponent",
+        action="append",
+        default=[],
+        metavar="NAME=SOURCE,DECK",
+        help=(
+            "Add an inspected public .py/.ipynb agent and bind it to its own deck. "
+            "The source is executed locally."
+        ),
+    )
+    parser.add_argument(
         "--opponent-deck",
         action="append",
         default=[],
@@ -620,7 +668,11 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     official_dir = resolve_official_dir(args.official_dir)
     checkpoint = args.checkpoint.expanduser().resolve()
-    builtin_opponents = args.opponent or ["rule", "policy"]
+    builtin_opponents = (
+        args.opponent
+        if args.opponent is not None
+        else ([] if args.external_opponent else ["rule", "policy"])
+    )
     opponents = [
         AgentSpec(
             name=name,
@@ -636,6 +688,11 @@ def main(argv: list[str] | None = None) -> int:
         for specification in args.mcts_opponent:
             name, path = _named_path(specification, "--mcts-opponent")
             opponents.append(AgentSpec(name, "mcts", str(path)))
+        external_opponents = [
+            _external_opponent_spec(specification)
+            for specification in args.external_opponent
+        ]
+        opponents.extend(external_opponents)
         if args.opponent_deck:
             decks = [
                 DeckSpec(name, str(path))
@@ -646,7 +703,15 @@ def main(argv: list[str] | None = None) -> int:
             ]
         else:
             decks = _default_decks(official_dir)
-    except ValueError as error:
+        known_deck_paths = {Path(item.path) for item in decks}
+        for opponent in external_opponents:
+            if opponent.deck_path is None:
+                continue
+            deck_path = Path(opponent.deck_path)
+            if deck_path not in known_deck_paths:
+                decks.append(DeckSpec(opponent.name, str(deck_path)))
+                known_deck_paths.add(deck_path)
+    except (FileNotFoundError, ValueError) as error:
         raise SystemExit(str(error)) from error
 
     result = evaluate_meta_panel(
