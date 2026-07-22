@@ -455,8 +455,104 @@ python -m poketcg.rl.evaluate_meta_panel \
   --output results/mega_lucario_screen50.json
 ```
 
+也可以用重复的 `--external-candidate NAME=SOURCE,DECK` 把多名已审计的公开 Agent 放到候选侧。
+每名候选固定使用自己的 `deck.csv`，报告的 `candidate_decks` 和每个 cell 的 `candidate_deck`
+会记录实际绑定，避免过去“换了 Agent 却仍使用我方 Mega 牌组”的失真评测。做公开 Agent
+round-robin 时，需要在候选侧和对手侧分别列出同一组 Agent：
+
+```bash
+python -m poketcg.rl.evaluate_meta_panel \
+  --checkpoint artifacts/checkpoints/ppo_v3_semantic_population_iter0018.pt \
+  --games-per-seat 20 --workers 1 --torch-threads 1 \
+  --external-candidate agent_a=artifacts/public_agents/agent_a/main.py,artifacts/public_agents/agent_a/deck.csv \
+  --external-candidate agent_b=artifacts/public_agents/agent_b/main.py,artifacts/public_agents/agent_b/deck.csv \
+  --external-opponent agent_a=artifacts/public_agents/agent_a/main.py,artifacts/public_agents/agent_a/deck.csv \
+  --external-opponent agent_b=artifacts/public_agents/agent_b/main.py,artifacts/public_agents/agent_b/deck.csv \
+  --output results/evaluation/public_agents_round_robin_screen20x2.json
+```
+
+外部 Agent 若没有显式 episode reset hook，适配器会在每局开始前重新加载源码，防止模块全局
+计划、回合计数等状态泄漏到下一局。先用 20×2 淘汰弱候选，再对晋级者和关键 meta 对手做
+500×2 确认；round-robin 的简单平均不能替代按线上牌组占比计算的加权结果。
+
 外部源码会在本机执行，因此必须先人工检查；本项目不复制或重新发布第三方 Agent 源码。若作者
 未声明许可证，只把它作为本地比赛评测依赖使用。
+
+下载线上 replay JSON 后，可按对手牌组、终局原因、Land Collapse 启动速度和最终牌库差做失败
+诊断。`--input` 可以是单个 JSON，也可以是包含多局 replay 的目录：
+
+```bash
+python -m poketcg.rl.replay_diagnostics \
+  --input artifacts/replays/54891713 \
+  --team yqqxyy \
+  --output results/evaluation/libraryout_54891713_loss_diagnostics.json
+```
+
+本地修改过并已审计的外部 `.py` Agent 可以独立打包，不需要伪造 checkpoint。打包器会检查
+Python 语法、60 张牌、官方 `cg` 文件和归档根目录结构：
+
+```bash
+python -m poketcg.external_submission \
+  --source artifacts/public_agents/libraryout_v2/main.py \
+  --deck artifacts/public_agents/libraryout_v2/deck.csv \
+  --output artifacts/submissions/libraryout_v2/submission.tar.gz
+```
+
+### Library-Out trajectory dataset 与 residual reranker
+
+线上更强的 Library-Out V1 保持为生产基线。采集器在不改动公开源码的前提下，记录 V1 每次
+决策的 V3 observation、合法动作、逐动作规则分数、实际动作、对手、座位和终局结果。规则分数
+只在当前 selection 内做 z-score，不跨 context 比较。下面的 1400 局日程包含 7 类对手 × 双座位
+各 100 局，适合 Colab 8 CPU 的第一轮：
+
+```bash
+python -m poketcg.rl.collect_libraryout_trajectories \
+  --expert-source artifacts/public_agents/libraryout_1208/main.py \
+  --expert-deck artifacts/public_agents/libraryout_1208/deck.csv \
+  --mirror \
+  --external-opponent strong_start=artifacts/public_agents/strong_start_v10/main.py,artifacts/public_agents/strong_start_v10/deck.csv \
+  --external-opponent baseline1084=artifacts/public_agents/baseline_1084/main.py,artifacts/public_agents/baseline_1084/deck.csv \
+  --external-opponent alakazam=artifacts/public_agents/alakazam_best5/main.py,artifacts/public_agents/alakazam_best5/deck.csv \
+  --external-opponent field_alakazam=artifacts/public_agents/field_audited_alakazam_v8/main.py,artifacts/public_agents/field_audited_alakazam_v8/deck.csv \
+  --external-opponent archaludon=artifacts/public_agents/archaludon_vs_starmie/main.py,artifacts/public_agents/archaludon_vs_starmie/deck.csv \
+  --external-opponent mega_lucario=artifacts/public_agents/mega_lucario/a-sample-rule-based-agent-mega-lucario-ex-deck.ipynb,artifacts/public_agents/mega_lucario/deck.csv \
+  --games 1400 --workers 8 --torch-threads 1 --encoder-version 3 \
+  --output /content/drive/MyDrive/pokemonTCG/residual/libraryout_v1_trajectory_1400.jsonl
+```
+
+Round 0 使用 outcome-weighted imitation：胜局权重 1.0、和局 0.5、败局 0.25。Transformer
+输出的是对规则 prior 的修正量，并用 L2 将残差约束在零附近；它不是重新从头学习完整策略。
+
+```bash
+python -m poketcg.rl.train_residual \
+  --input /content/drive/MyDrive/pokemonTCG/residual/libraryout_v1_trajectory_1400.jsonl \
+  --output /content/drive/MyDrive/pokemonTCG/checkpoints/libraryout_residual_round0.pt \
+  --epochs 8 --batch-size 128 --learning-rate 0.0001 \
+  --hidden-size 256 --num-layers 3 --num-heads 4 \
+  --prior-strength 2.0 --residual-coefficient 0.01 \
+  --override-margin 0.5 --minimum-confidence 0.65 \
+  --device cuda --seed 20260722
+```
+
+先用 `--shadow` 只统计模型想覆盖哪些动作，不真正覆盖 V1；确认 proposed override 集中在合理
+context 后再去掉 `--shadow`。第一轮 screen 不用于提交，只验证门控覆盖率和固定面板胜率：
+
+```bash
+python -m poketcg.rl.evaluate_residual \
+  --checkpoint /content/drive/MyDrive/pokemonTCG/checkpoints/libraryout_residual_round0.pt \
+  --baseline-source artifacts/public_agents/libraryout_1208/main.py \
+  --baseline-deck artifacts/public_agents/libraryout_1208/deck.csv \
+  --external-opponent mirror=artifacts/public_agents/libraryout_1208/main.py,artifacts/public_agents/libraryout_1208/deck.csv \
+  --external-opponent alakazam=artifacts/public_agents/alakazam_best5/main.py,artifacts/public_agents/alakazam_best5/deck.csv \
+  --external-opponent archaludon=artifacts/public_agents/archaludon_vs_starmie/main.py,artifacts/public_agents/archaludon_vs_starmie/deck.csv \
+  --games-per-seat 100 --device cuda --shadow \
+  --output /content/drive/MyDrive/pokemonTCG/results/libraryout_residual_round0_shadow100x2.json
+```
+
+这一轮只有专家动作和终局监督，不包含同一状态下所有替代动作的真实反事实收益。因此它的目标
+是建立一个保守、可校准的 reranker 和数据管线，而不是立刻超过 V1。只有影子模型稳定后，才对
+高分歧、低规则 margin 的局面追加 MCTS/counterfactual rollout 标签，形成真正能学习覆盖规则的
+Round 1 数据。
 
 ### Mega Lucario 显式战术规划器
 
@@ -500,7 +596,126 @@ python -m poketcg.rl.planner_diagnostics \
 净增加的正确决策数，以及主要分歧动作。路由器会固定交给规划器处理搜索选牌、Aura Jab 附能
 来源/目标与开局摆场；强制换上与普通换位仍优先保留给神经策略。
 
+### 座位对称性与计划所有权
+
+V3 Encoder 统一按“行动方、对手方”顺序编码标量状态、场上卡牌和弃牌 token。下面的审计会把
+双方绝对标签、`yourIndex`、`firstPlayer`、结果和所有 `playerIndex` 一起交换，再比较编码、
+option logits、确定性动作和 Value。当前 Value 是行动方视角，因此正确关系是
+`V(relabel(s)) == V(s)`，而不是取负：
+
+```bash
+python -m poketcg.rl.symmetry_diagnostics \
+  --checkpoint artifacts/checkpoints/ppo_v3_semantic_population_iter0018.pt \
+  --deck artifacts/public_agents/mega_lucario/deck.csv \
+  --games-per-seat 10 \
+  --output results/evaluation/player_symmetry_10x2.json
+```
+
+`turn-planner-policy` 在每个回合第一次 `MAIN` 决策时选定 Planner 或 Policy owner，并让该 owner
+负责本回合后续所有 MAIN 和 resolver 选择。只有缓存计划的攻击手或目标失效时，Planner owner
+才会向 Policy 做一次不可逆转移。报告中的 `candidate_policy.turn_ownership` 包含 owner 分布、
+owner 切换、计划失效和两类 owner 的决策数。三臂 screen：
+
+```bash
+python -m poketcg.rl.evaluate_meta_panel \
+  --checkpoint artifacts/checkpoints/ppo_v3_semantic_population_iter0018.pt \
+  --model-deck artifacts/public_agents/mega_lucario/deck.csv \
+  --games-per-seat 100 --workers 1 --torch-threads 1 --deterministic \
+  --candidate policy --candidate planner-policy \
+  --candidate turn-planner-policy \
+  --planner-threshold 0.8 --planner-weight 4.0 \
+  --external-opponent mega_lucario=artifacts/public_agents/mega_lucario/a-sample-rule-based-agent-mega-lucario-ex-deck.ipynb,artifacts/public_agents/mega_lucario/deck.csv \
+  --output results/evaluation/mega_turn_ownership_screen100x2.json
+```
+
+先确认 `owner_switches_per_turn` 接近 0，并分别检查 player0/player1；只有整回合版本相对两条基线
+都不退步，才扩大到 500×2。当前原子动作 MCTS 尚不支持 turn ownership，两者需要等
+plan-level MCTS 后再组合。
+
+`commitment-planner-policy` 是更严格的 Options 版本。普通 MAIN 动作只建立临时
+`resolver_chain`：触发的选牌、弃牌和目标选择沿用同一个 owner，一旦回到 MAIN 就释放。
+只有 Planner 选择的动作确实命中当前攻击计划——计划内的附能、进化、换位、Boss、增伤或攻击——
+才建立 `committed_turn`，控制剩余回合。抽牌 Ability 不再因为出现在回合开头而获得整回合
+所有权。报告中的 `candidate_policy.commitment_ownership` 会分别统计 resolver chains、
+committed turns、chain resolutions、计划失效和两类 owner 的决策数。
+
+与旧路由和宽松整回合版本做四臂 screen：
+
+```bash
+python -m poketcg.rl.evaluate_meta_panel \
+  --checkpoint artifacts/checkpoints/ppo_v3_semantic_population_iter0018.pt \
+  --model-deck artifacts/public_agents/mega_lucario/deck.csv \
+  --games-per-seat 100 --workers 1 --torch-threads 1 --deterministic \
+  --candidate policy --candidate planner-policy \
+  --candidate turn-planner-policy --candidate commitment-planner-policy \
+  --planner-threshold 0.8 --planner-weight 4.0 \
+  --external-opponent mega_lucario=artifacts/public_agents/mega_lucario/a-sample-rule-based-agent-mega-lucario-ex-deck.ipynb,artifacts/public_agents/mega_lucario/deck.csv \
+  --output results/evaluation/mega_commitment_ownership_screen100x2.json
+```
+
+### Plan-level MCTS V0
+
+`plan-mcts` 不再搜索原子 action，而是在每个回合第一次非强制 MAIN 决策上比较两个完整宏执行器：
+
+- `local_router_turn`：稳健的 PlannerPolicy 逐 context 路由执行到换手；
+- `planner_turn`：TacticalPlanner 独占执行到换手。
+
+每个宏分支从同一个官方 Search root 开始，在多次 determinization 下推进到换手、终局或
+`max_macro_steps`，然后把 checkpoint Value 统一转换为根玩家视角并取均值。选中的 executor 会在
+真实对局中持续拥有整个回合，即使两个宏分支第一步动作相同，后续也不会丢失搜索选择。V0 是
+两分支的 root-level Monte Carlo exhaustive search；在证明宏选择有效前，不增加更深的 PUCT 树。
+
+先用 oracle hidden-deck prior 做 Mega 专家 50×2 screen，隔离宏搜索本身是否有效：
+
+```bash
+python -m poketcg.rl.evaluate_meta_panel \
+  --checkpoint artifacts/checkpoints/ppo_v3_semantic_population_iter0018.pt \
+  --model-deck artifacts/public_agents/mega_lucario/deck.csv \
+  --games-per-seat 50 --workers 1 --torch-threads 1 --deterministic \
+  --candidate planner-policy --candidate turn-planner-policy \
+  --candidate plan-mcts \
+  --mcts-prior oracle --plan-determinizations 4 --plan-max-steps 32 \
+  --planner-threshold 0.8 --planner-weight 4.0 \
+  --external-opponent mega_lucario=artifacts/public_agents/mega_lucario/a-sample-rule-based-agent-mega-lucario-ex-deck.ipynb,artifacts/public_agents/mega_lucario/deck.csv \
+  --output results/evaluation/plan_mcts_mega_screen50x2.json
+```
+
+`candidate_search` 会输出两种宏的选择次数、平均 Value、selection margin、near-tie rate、首动作
+相同率、宏步数、边界、延迟和错误。oracle 只用于诊断；通过后必须再评测 `belief` 或
+`fixed-model`，才能构建可提交版本。
+
+`belief` 会在四个面板牌组与我方牌组之间维护 Bayesian posterior，并根据整局已公开过的卡牌更新
+假设；它不读取真实隐藏牌组，可用于提交前验证：
+
+```bash
+python -m poketcg.rl.evaluate_meta_panel \
+  --checkpoint artifacts/checkpoints/ppo_v3_semantic_population_iter0018.pt \
+  --model-deck artifacts/public_agents/mega_lucario/deck.csv \
+  --games-per-seat 50 --workers 4 --torch-threads 1 --deterministic \
+  --candidate planner-policy --candidate plan-mcts \
+  --opponent rule --opponent policy \
+  --mcts-prior belief --plan-determinizations 4 --plan-max-steps 32 \
+  --planner-threshold 0.8 --planner-weight 4.0 \
+  --output results/evaluation/plan_mcts_belief_meta_screen50.json
+```
+
 ## 外部专家策略蒸馏
+
+### 原生 Mega Lucario 专家 parity
+
+`MegaLucarioExpertAgent` 是公开 Mega Lucario notebook 的可重置原生实现。改动专家逻辑后，先让
+notebook 驱动真实对局、原生版本逐状态 shadow，要求动作顺序严格一致：
+
+```bash
+python -m poketcg.rl.expert_parity \
+  --expert-source artifacts/public_agents/mega_lucario/a-sample-rule-based-agent-mega-lucario-ex-deck.ipynb \
+  --deck artifacts/public_agents/mega_lucario/deck.csv \
+  --games-per-seat 10 \
+  --output results/evaluation/mega_native_expert_parity10x2.json
+```
+
+`parity.exact_match_rate` 必须为 `1.0`，且 `context_mismatches` 为空。评测面板中的原生候选名为
+`mega-expert`，可直接与同一个 external notebook 做镜像确认。
 
 `collect_external_expert` 只记录经过人工检查的外部专家一方的 observation/action，并在对局结束
 后从专家视角回填 Value target。采集日程对每种对手轮换两个座位，避免把对手类型和先后手混在
@@ -674,6 +889,69 @@ python -m poketcg.submission \
   --mcts-simulations 8 --mcts-determinizations 1 \
   --output artifacts/submissions/mega_planner_mcts8/submission.tar.gz
 ```
+
+构建不含 MCTS 的整回合 ownership 实验提交：
+
+```bash
+python -m poketcg.submission \
+  --checkpoint artifacts/checkpoints/ppo_v3_semantic_population_iter0018.pt \
+  --deck artifacts/public_agents/mega_lucario/deck.csv \
+  --planner-turn-ownership --planner-threshold 0.8 --planner-weight 4.0 \
+  --output artifacts/submissions/mega_turn_ownership/submission.tar.gz
+```
+
+严格 commitment ownership 使用：
+
+```bash
+python -m poketcg.submission \
+  --checkpoint artifacts/checkpoints/ppo_v3_semantic_population_iter0018.pt \
+  --deck artifacts/public_agents/mega_lucario/deck.csv \
+  --planner-commitment-ownership \
+  --planner-threshold 0.8 --planner-weight 4.0 \
+  --output artifacts/submissions/mega_commitment_ownership/submission.tar.gz
+```
+
+构建使用 fixed-model prior 的 Plan-level MCTS V0：
+
+```bash
+python -m poketcg.submission \
+  --checkpoint artifacts/checkpoints/ppo_v3_semantic_population_iter0018.pt \
+  --deck artifacts/public_agents/mega_lucario/deck.csv \
+  --plan-mcts --plan-determinizations 4 --plan-max-steps 32 \
+  --planner-threshold 0.8 --planner-weight 4.0 \
+  --output artifacts/submissions/mega_plan_mcts_d4/submission.tar.gz
+```
+
+构建与 meta panel 相同的多牌组 belief 版本：
+
+```bash
+python -m poketcg.submission \
+  --checkpoint artifacts/checkpoints/ppo_v3_semantic_population_iter0018.pt \
+  --deck artifacts/public_agents/mega_lucario/deck.csv \
+  --plan-mcts --plan-mcts-prior belief \
+  --plan-determinizations 4 --plan-max-steps 32 \
+  --planner-threshold 0.8 --planner-weight 4.0 \
+  --belief-deck sample=data/official/sample_submission/sample_submission/deck.csv \
+  --belief-deck meta_a=configs/opponent_decks/meta_a.csv \
+  --belief-deck fishcat_v8=configs/opponent_decks/fishcat_v8.csv \
+  --belief-deck mcts_sample=configs/opponent_decks/mcts_sample.csv \
+  --output artifacts/submissions/mega_plan_mcts_belief_d4/submission.tar.gz
+```
+
+每个 `--belief-deck NAME=PATH` 的60张卡ID会写入 `agent_config.json`，runtime 还会自动追加提交使用的
+我方牌组为 `model` 假设。未显式选择 `--plan-mcts-prior belief` 时仍保持原来的 fixed-model 行为。
+
+构建不使用神经决策的原生 Mega Lucario 专家基准：
+
+```bash
+python -m poketcg.submission \
+  --checkpoint artifacts/checkpoints/ppo_v3_semantic_population_iter0018.pt \
+  --deck artifacts/public_agents/mega_lucario/deck.csv \
+  --mega-expert \
+  --output artifacts/submissions/mega_native_expert/submission.tar.gz
+```
+
+checkpoint 仅保留为运行时异常的延迟 fallback；正常 `mega-expert` 模式不会初始化或调用神经模型。
 
 归档中的 `agent_config.json` 决定线上使用 direct policy、planner-policy 还是 planner-MCTS。
 MCTS runtime 使用官方 Search API；初始化或搜索失败时依次降级到混合/原 PPO policy、

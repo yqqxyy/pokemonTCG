@@ -26,6 +26,8 @@ _POLICY: Any | None = None
 _PLANNER: Any | None = None
 _HYBRID: Any | None = None
 _MCTS: Any | None = None
+_PLAN_MCTS: Any | None = None
+_MEGA_EXPERT: Any | None = None
 _RULE_AGENT: Any | None = None
 _POLICY_DISABLED = False
 _MCTS_DISABLED = False
@@ -103,6 +105,25 @@ def _get_rule_agent() -> Any | None:
     return _RULE_AGENT
 
 
+def _get_mega_expert() -> Any | None:
+    global _MEGA_EXPERT
+    if _CONFIG.get("mode") != "mega-expert":
+        return None
+    if _MEGA_EXPERT is not None:
+        return _MEGA_EXPERT
+    try:
+        from poketcg.agents import MegaLucarioExpertAgent
+
+        cards, _ = _catalogs()
+        _MEGA_EXPERT = MegaLucarioExpertAgent(
+            card_catalog=cards,
+            deck=_read_deck(),
+        )
+    except Exception:
+        traceback.print_exc()
+    return _MEGA_EXPERT
+
+
 def _get_planner() -> Any | None:
     global _PLANNER
     if _PLANNER is not None:
@@ -139,6 +160,10 @@ def _get_hybrid() -> Any | None:
             planner_threshold=float(settings.get("threshold", 0.8)),
             planner_weight=float(settings.get("weight", 4.0)),
             confidence_routing=bool(settings.get("confidence_routing", True)),
+            turn_ownership=bool(settings.get("turn_ownership", False)),
+            commitment_ownership=bool(
+                settings.get("commitment_ownership", False)
+            ),
             deterministic=False,
             seed=20260721,
         )
@@ -199,6 +224,107 @@ def _get_mcts() -> Any | None:
     return _MCTS
 
 
+def _get_plan_mcts() -> Any | None:
+    global _PLAN_MCTS
+    if _CONFIG.get("mode") != "plan-mcts":
+        return None
+    if _PLAN_MCTS is not None:
+        return _PLAN_MCTS
+    try:
+        from poketcg.agents import PlannerPolicyAgent, TacticalPlannerAgent
+        from poketcg.mcts import (
+            DeckDeterminizer,
+            DeckHypothesis,
+            OpponentDeckBelief,
+            PlanLevelMCTSAgent,
+            PlanMCTSConfig,
+        )
+
+        policy = _get_policy()
+        if policy is None:
+            raise RuntimeError("Plan-level MCTS policy failed to initialize")
+        cards, attacks = _catalogs()
+        deck = _read_deck()
+        basic_card_ids = {
+            card_id
+            for card_id, card in cards.items()
+            if bool(getattr(card, "basic", False))
+        }
+        planner_settings = _CONFIG.get("planner") or {}
+        local_executor = PlannerPolicyAgent(
+            policy,
+            TacticalPlannerAgent(
+                card_catalog=cards,
+                attack_catalog=attacks,
+                seed=20260723,
+            ),
+            planner_threshold=float(planner_settings.get("threshold", 0.8)),
+            planner_weight=float(planner_settings.get("weight", 4.0)),
+            confidence_routing=bool(
+                planner_settings.get("confidence_routing", True)
+            ),
+            deterministic=True,
+            seed=20260724,
+        )
+        planner_executor = TacticalPlannerAgent(
+            card_catalog=cards,
+            attack_catalog=attacks,
+            seed=20260725,
+        )
+        settings = _CONFIG.get("plan_mcts") or {}
+        config = PlanMCTSConfig(
+            determinizations=int(settings.get("determinizations", 4)),
+            max_macro_steps=int(settings.get("max_macro_steps", 32)),
+            root_contexts=tuple(
+                int(value) for value in settings.get("root_contexts", [0])
+            ),
+        )
+        prior = str(settings.get("prior", "fixed-model"))
+        opponent_belief = None
+        if prior == "belief":
+            hypotheses = []
+            names = set()
+            for item in settings.get("belief_hypotheses") or []:
+                if not isinstance(item, dict):
+                    raise TypeError("Plan MCTS belief hypotheses must be objects")
+                name = str(item.get("name", "")).strip()
+                values = tuple(int(value) for value in item.get("deck") or [])
+                if not name or name in names:
+                    raise ValueError(f"Invalid Plan MCTS belief deck name: {name!r}")
+                names.add(name)
+                hypotheses.append(
+                    DeckHypothesis(
+                        name,
+                        values,
+                        prior=float(item.get("prior", 1.0)),
+                    )
+                )
+            if "model" not in names:
+                hypotheses.append(DeckHypothesis("model", tuple(deck)))
+            if not hypotheses:
+                raise ValueError("Plan MCTS belief prior has no deck hypotheses")
+            opponent_belief = OpponentDeckBelief(hypotheses)
+        elif prior != "fixed-model":
+            raise ValueError(f"Unknown Plan MCTS prior: {prior!r}")
+        determinizer = DeckDeterminizer(
+            deck,
+            deck,
+            basic_card_ids=basic_card_ids,
+            seed=20260726,
+            opponent_belief=opponent_belief,
+        )
+        _PLAN_MCTS = PlanLevelMCTSAgent(
+            local_executor,
+            planner_executor,
+            policy,
+            determinizer,
+            config=config,
+        )
+    except Exception:
+        traceback.print_exc()
+    return _PLAN_MCTS
+
+
 def _minimum_legal_action(observation: dict) -> list[int]:
     selection = observation["select"]
     minimum = int(selection["minCount"])
@@ -211,6 +337,10 @@ def _minimum_legal_action(observation: dict) -> list[int]:
 def agent(obs_dict: dict) -> list[int]:
     """Return the deck initially, then select legal option indices during battle."""
     if obs_dict.get("select") is None:
+        if _MEGA_EXPERT is not None:
+            _MEGA_EXPERT.reset_episode()
+        if _PLAN_MCTS is not None:
+            _PLAN_MCTS.reset_episode()
         if _MCTS is not None:
             _MCTS.reset_episode()
         if _HYBRID is not None:
@@ -218,6 +348,20 @@ def agent(obs_dict: dict) -> list[int]:
         elif _PLANNER is not None:
             _PLANNER.reset_episode()
         return _read_deck()
+
+    mega_expert = _get_mega_expert()
+    if mega_expert is not None:
+        try:
+            return mega_expert.choose_action(obs_dict)
+        except Exception:
+            traceback.print_exc()
+
+    plan_mcts = _get_plan_mcts()
+    if plan_mcts is not None:
+        try:
+            return plan_mcts.choose_action(obs_dict)
+        except Exception:
+            traceback.print_exc()
 
     mcts = _get_mcts()
     if mcts is not None:
@@ -234,7 +378,7 @@ def agent(obs_dict: dict) -> list[int]:
                 return planner.choose_action(obs_dict)
             except Exception:
                 traceback.print_exc()
-    elif mode in {"planner-policy", "planner-mcts"}:
+    elif mode in {"planner-policy", "planner-mcts", "plan-mcts"}:
         hybrid = _get_hybrid()
         if hybrid is not None:
             try:

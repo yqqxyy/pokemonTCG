@@ -267,3 +267,239 @@ def test_planner_policy_exposes_planner_biased_mcts_logits() -> None:
 
     assert evaluation.logits.argmax().item() == 1
     assert evaluation.value == 0.25
+
+
+def test_planner_keeps_the_same_valid_plan_across_main_decisions() -> None:
+    cards, attacks = _catalogs()
+    first = _observation(
+        [
+            {"type": int(OptionType.ATTACK), "attackId": 982},
+            {"type": int(OptionType.ATTACK), "attackId": 983},
+            {"type": int(OptionType.END)},
+        ]
+    )
+    planner = TacticalPlannerAgent(card_catalog=cards, attack_catalog=attacks, seed=1)
+
+    initial = planner.evaluate(first, persist=True)
+    repeated = planner.evaluate(first, persist=True)
+
+    assert initial.plan is not None
+    assert repeated.plan is initial.plan
+
+
+def test_turn_ownership_keeps_planner_for_follow_up_context() -> None:
+    cards, attacks = _catalogs()
+    main = _observation(
+        [
+            {"type": int(OptionType.ATTACK), "attackId": 982},
+            {"type": int(OptionType.ATTACK), "attackId": 983},
+            {"type": int(OptionType.END)},
+        ]
+    )
+    follow_up = _observation([])
+    follow_up["select"] = {
+        "context": int(SelectContext.DISCARD),
+        "minCount": 1,
+        "maxCount": 1,
+        "option": [
+            {"type": int(OptionType.CARD), "area": int(AreaType.HAND), "index": i}
+            for i in range(3)
+        ],
+        "deck": None,
+    }
+    follow_up["current"]["players"][0]["hand"] = [
+        {"id": 6, "serial": 50},
+        {"id": 677, "serial": 51},
+        {"id": 1102, "serial": 52},
+    ]
+    policy = _RecordingPolicy()
+    hybrid = PlannerPolicyAgent(
+        policy,  # type: ignore[arg-type]
+        TacticalPlannerAgent(card_catalog=cards, attack_catalog=attacks, seed=1),
+        planner_threshold=0.7,
+        confidence_routing=True,
+        turn_ownership=True,
+    )
+
+    assert hybrid.choose_action(main) == [1]
+    hybrid.choose_action(follow_up)
+
+    metrics = hybrid.metrics()["turn_ownership"]
+    assert policy.calls == 0
+    assert metrics["planner_owned_turns"] == 1
+    assert metrics["planner_owned_decisions"] == 2
+    assert metrics["owner_switches"] == 0
+
+
+def test_turn_ownership_keeps_policy_even_when_follow_up_is_planner_priority() -> None:
+    cards, attacks = _catalogs()
+    main = _observation(
+        [
+            {"type": int(OptionType.ATTACK), "attackId": 982},
+            {"type": int(OptionType.ATTACK), "attackId": 983},
+            {"type": int(OptionType.END)},
+        ]
+    )
+    follow_up = _observation([])
+    follow_up["select"] = {
+        "context": int(SelectContext.TO_HAND),
+        "minCount": 1,
+        "maxCount": 1,
+        "option": [
+            {"type": int(OptionType.CARD), "area": int(AreaType.DECK), "index": i}
+            for i in range(3)
+        ],
+        "deck": [
+            {"id": 6, "serial": 60},
+            {"id": 677, "serial": 61},
+            {"id": 1102, "serial": 62},
+        ],
+    }
+    policy = _RecordingPolicy()
+    hybrid = PlannerPolicyAgent(
+        policy,  # type: ignore[arg-type]
+        TacticalPlannerAgent(card_catalog=cards, attack_catalog=attacks, seed=1),
+        confidence_routing=False,
+        turn_ownership=True,
+    )
+
+    assert hybrid.choose_action(main) == [2]
+    assert hybrid.choose_action(follow_up) == [2]
+
+    metrics = hybrid.metrics()["turn_ownership"]
+    assert policy.calls == 2
+    assert metrics["policy_owned_turns"] == 1
+    assert metrics["policy_owned_decisions"] == 2
+    assert metrics["owner_switches"] == 0
+
+
+def test_invalid_planner_plan_transfers_remaining_turn_to_policy() -> None:
+    cards, attacks = _catalogs()
+    main = _observation(
+        [
+            {"type": int(OptionType.ATTACK), "attackId": 982},
+            {"type": int(OptionType.ATTACK), "attackId": 983},
+            {"type": int(OptionType.END)},
+        ]
+    )
+    invalidated = _observation(
+        [
+            {"type": int(OptionType.ATTACK), "attackId": 982},
+            {"type": int(OptionType.ATTACK), "attackId": 983},
+            {"type": int(OptionType.END)},
+        ]
+    )
+    invalidated["current"]["players"][1]["active"] = []
+    policy = _RecordingPolicy()
+    hybrid = PlannerPolicyAgent(
+        policy,  # type: ignore[arg-type]
+        TacticalPlannerAgent(card_catalog=cards, attack_catalog=attacks, seed=1),
+        planner_threshold=0.7,
+        confidence_routing=True,
+        turn_ownership=True,
+    )
+
+    assert hybrid.choose_action(main) == [1]
+    assert hybrid.choose_action(invalidated) == [2]
+
+    metrics = hybrid.metrics()["turn_ownership"]
+    assert policy.calls == 1
+    assert metrics["owner_switches"] == 1
+    assert metrics["plan_invalidations"] == 1
+    assert metrics["policy_owned_decisions"] == 1
+
+
+def test_commitment_ownership_treats_draw_ability_as_resolver_chain() -> None:
+    cards, attacks = _catalogs()
+    cards[675] = {"cardType": 0, "hp": 70, "attacks": [], "basic": True}
+    ability = _observation(
+        [
+            {
+                "type": int(OptionType.ABILITY),
+                "area": int(AreaType.BENCH),
+                "index": 0,
+            },
+            {"type": int(OptionType.END)},
+        ]
+    )
+    ability["current"]["players"][0]["bench"] = [_pokemon(675, 30, 70, 0)]
+    attack = _observation(
+        [
+            {"type": int(OptionType.ATTACK), "attackId": 982},
+            {"type": int(OptionType.ATTACK), "attackId": 983},
+            {"type": int(OptionType.END)},
+        ]
+    )
+    attack["current"]["players"][0]["bench"] = [_pokemon(675, 30, 70, 0)]
+    policy = _RecordingPolicy()
+    planner = TacticalPlannerAgent(card_catalog=cards, attack_catalog=attacks, seed=1)
+    hybrid = PlannerPolicyAgent(
+        policy,  # type: ignore[arg-type]
+        planner,
+        planner_threshold=0.7,
+        confidence_routing=True,
+        commitment_ownership=True,
+    )
+
+    ability_evaluation = planner.evaluate(ability, persist=False)
+    assert planner.routing_reason(
+        ability,
+        ability_evaluation,
+        threshold=0.7,
+        allow_confidence=True,
+    ) == "main:draw-engine-ability"
+    assert not planner.is_plan_commitment(ability, ability_evaluation)
+
+    assert hybrid.choose_action(ability) == [0]
+    assert hybrid.choose_action(attack) == [1]
+
+    metrics = hybrid.metrics()["commitment_ownership"]
+    assert policy.calls == 0
+    assert metrics["resolver_chains"] == 1
+    assert metrics["committed_turns"] == 1
+    assert metrics["chain_resolutions"] == 1
+    assert metrics["planner_segments"] == 2
+
+
+def test_commitment_ownership_keeps_policy_for_its_resolver_chain_only() -> None:
+    cards, attacks = _catalogs()
+    main = _observation(
+        [
+            {"type": int(OptionType.ATTACK), "attackId": 982},
+            {"type": int(OptionType.ATTACK), "attackId": 983},
+            {"type": int(OptionType.END)},
+        ]
+    )
+    follow_up = _observation([])
+    follow_up["select"] = {
+        "context": int(SelectContext.TO_HAND),
+        "minCount": 1,
+        "maxCount": 1,
+        "option": [
+            {"type": int(OptionType.CARD), "area": int(AreaType.DECK), "index": i}
+            for i in range(3)
+        ],
+        "deck": [
+            {"id": 6, "serial": 60},
+            {"id": 677, "serial": 61},
+            {"id": 1102, "serial": 62},
+        ],
+    }
+    policy = _RecordingPolicy()
+    hybrid = PlannerPolicyAgent(
+        policy,  # type: ignore[arg-type]
+        TacticalPlannerAgent(card_catalog=cards, attack_catalog=attacks, seed=1),
+        confidence_routing=False,
+        commitment_ownership=True,
+    )
+
+    assert hybrid.choose_action(main) == [2]
+    assert hybrid.choose_action(follow_up) == [2]
+    assert hybrid.choose_action(main) == [2]
+
+    metrics = hybrid.metrics()["commitment_ownership"]
+    assert policy.calls == 3
+    assert metrics["resolver_chains"] == 2
+    assert metrics["committed_turns"] == 0
+    assert metrics["chain_resolutions"] == 1
+    assert metrics["policy_segments"] == 2

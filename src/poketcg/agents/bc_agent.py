@@ -11,7 +11,7 @@ from torch import Tensor
 
 from poketcg.rl.action_space import deterministic_subset, neural_selection, sample_subset
 from poketcg.rl.data import BCExample, collate_bc
-from poketcg.rl.features import build_feature_encoder
+from poketcg.rl.features import EncodedDecision, build_feature_encoder
 from poketcg.rl.model import action_space_version, build_model, encoder_version
 
 from .rule_agent import RuleAgent
@@ -66,13 +66,17 @@ class BCPolicyAgent:
     def action_space_version(self) -> int:
         return self._action_space_version
 
+    def encode(self, observation: dict) -> EncodedDecision:
+        """Expose the acting-player-relative representation for diagnostics."""
+        return self._encoder.encode(observation)
+
     def evaluate(self, observation: dict) -> PolicyValueEvaluation:
         """Evaluate any non-initial selection, including resolver-owned decisions."""
         selection = observation.get("select")
         if selection is None:
             raise ValueError("BCPolicyAgent received the initial deck-selection observation.")
 
-        decision = self._encoder.encode(observation)
+        decision = self.encode(observation)
         example = BCExample(
             decision=decision,
             action=list(range(decision.minimum)),
@@ -107,6 +111,20 @@ class BCPolicyAgent:
         if self._deterministic:
             return deterministic_subset(valid_logits, minimum, maximum)
         return sample_subset(valid_logits, minimum, maximum, rng=self._rng)
+
+    def choose_deterministic_action(self, observation: dict) -> list[int]:
+        """Choose the policy argmax without changing the configured online mode."""
+        selection = observation.get("select")
+        if selection is None:
+            raise ValueError("BCPolicyAgent received the initial deck-selection observation.")
+        if not neural_selection(selection, self._action_space_version):
+            return self._fallback.choose_action(observation)
+        evaluation = self.evaluate(observation)
+        return deterministic_subset(
+            evaluation.logits,
+            evaluation.minimum,
+            evaluation.maximum,
+        )
 
 
 class HybridPolicyAgent:

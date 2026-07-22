@@ -18,6 +18,7 @@ import torch
 from poketcg.agents import (
     BCPolicyAgent,
     ExternalPythonAgent,
+    MegaLucarioExpertAgent,
     PlannerPolicyAgent,
     RandomAgent,
     RuleAgent,
@@ -30,6 +31,8 @@ from poketcg.mcts import (
     DeckHypothesis,
     MCTSConfig,
     OpponentDeckBelief,
+    PlanLevelMCTSAgent,
+    PlanMCTSConfig,
     PolicyValueMCTSAgent,
 )
 from poketcg.paths import PROJECT_ROOT, resolve_official_dir
@@ -71,6 +74,7 @@ class PanelTask:
     torch_threads: int
     mcts_prior: str
     mcts_config: MCTSConfig
+    plan_mcts_config: PlanMCTSConfig
     planner_threshold: float
     planner_weight: float
     planner_confidence_routing: bool
@@ -88,19 +92,17 @@ def _named_path(specification: str, option: str) -> tuple[str, Path]:
     return name, Path(raw_path).expanduser().resolve()
 
 
-def _external_opponent_spec(specification: str) -> AgentSpec:
+def _external_agent_spec(specification: str, option: str) -> AgentSpec:
     try:
         name, raw_paths = specification.split("=", 1)
         raw_source, raw_deck = raw_paths.rsplit(",", 1)
     except ValueError as error:
-        raise ValueError(
-            "--external-opponent must use NAME=SOURCE,DECK"
-        ) from error
+        raise ValueError(f"{option} must use NAME=SOURCE,DECK") from error
     name = name.strip()
     source = Path(raw_source.strip()).expanduser().resolve()
     deck = Path(raw_deck.strip()).expanduser().resolve()
     if not name or not raw_source.strip() or not raw_deck.strip():
-        raise ValueError("--external-opponent must use non-empty NAME=SOURCE,DECK")
+        raise ValueError(f"{option} must use non-empty NAME=SOURCE,DECK")
     if not source.is_file():
         raise FileNotFoundError(f"External agent source not found: {source}")
     if not deck.is_file():
@@ -167,7 +169,7 @@ def _reset_episode(agent: Any) -> None:
 
 
 def _search_metrics(agent: Any) -> dict[str, Any] | None:
-    if isinstance(agent, PolicyValueMCTSAgent):
+    if isinstance(agent, (PolicyValueMCTSAgent, PlanLevelMCTSAgent)):
         return agent.metrics()
     return None
 
@@ -196,6 +198,7 @@ def _build_agent(
     stochastic: bool,
     mcts_prior: str,
     mcts_config: MCTSConfig,
+    plan_mcts_config: PlanMCTSConfig,
     planner_threshold: float,
     planner_weight: float,
     planner_confidence_routing: bool,
@@ -213,6 +216,11 @@ def _build_agent(
             card_catalog=card_catalog,
             attack_catalog=attack_catalog,
             seed=seed,
+        )
+    if specification.kind == "mega-expert":
+        return MegaLucarioExpertAgent(
+            card_catalog=card_catalog,
+            deck=list(decks[player]),
         )
     if specification.kind == "external":
         if specification.source is None or specification.deck_path is None:
@@ -236,7 +244,33 @@ def _build_agent(
     )
     if specification.kind == "policy":
         return policy
-    if specification.kind in {"planner-policy", "planner-mcts"}:
+    plan_local: PlannerPolicyAgent | None = None
+    plan_executor: TacticalPlannerAgent | None = None
+    if specification.kind == "plan-mcts":
+        plan_local = PlannerPolicyAgent(
+            policy,
+            TacticalPlannerAgent(
+                card_catalog=card_catalog,
+                attack_catalog=attack_catalog,
+                seed=seed + 200_000,
+            ),
+            planner_threshold=planner_threshold,
+            planner_weight=planner_weight,
+            confidence_routing=planner_confidence_routing,
+            deterministic=True,
+            seed=seed + 250_000,
+        )
+        plan_executor = TacticalPlannerAgent(
+            card_catalog=card_catalog,
+            attack_catalog=attack_catalog,
+            seed=seed + 275_000,
+        )
+    if specification.kind in {
+        "planner-policy",
+        "turn-planner-policy",
+        "commitment-planner-policy",
+        "planner-mcts",
+    }:
         policy = PlannerPolicyAgent(
             policy,
             TacticalPlannerAgent(
@@ -247,12 +281,20 @@ def _build_agent(
             planner_threshold=planner_threshold,
             planner_weight=planner_weight,
             confidence_routing=planner_confidence_routing,
+            turn_ownership=specification.kind == "turn-planner-policy",
+            commitment_ownership=(
+                specification.kind == "commitment-planner-policy"
+            ),
             deterministic=not stochastic,
             seed=seed + 250_000,
         )
-        if specification.kind == "planner-policy":
+        if specification.kind in {
+            "planner-policy",
+            "turn-planner-policy",
+            "commitment-planner-policy",
+        }:
             return policy
-    elif specification.kind != "mcts":
+    elif specification.kind not in {"mcts", "plan-mcts"}:
         raise ValueError(f"Unknown agent kind: {specification.kind}")
 
     opponent = 1 - player
@@ -272,6 +314,16 @@ def _build_agent(
         seed=seed + 300_000,
         opponent_belief=belief,
     )
+    if specification.kind == "plan-mcts":
+        if plan_local is None or plan_executor is None:
+            raise AssertionError("Plan-level MCTS executors were not initialized")
+        return PlanLevelMCTSAgent(
+            plan_local,
+            plan_executor,
+            policy,
+            determinizer,
+            config=plan_mcts_config,
+        )
     return PolicyValueMCTSAgent(
         policy,
         determinizer,
@@ -318,6 +370,7 @@ def _run_cell(task: PanelTask) -> dict[str, Any]:
             stochastic=task.stochastic,
             mcts_prior=task.mcts_prior,
             mcts_config=task.mcts_config,
+            plan_mcts_config=task.plan_mcts_config,
             planner_threshold=task.planner_threshold,
             planner_weight=task.planner_weight,
             planner_confidence_routing=task.planner_confidence_routing,
@@ -335,6 +388,7 @@ def _run_cell(task: PanelTask) -> dict[str, Any]:
             stochastic=task.stochastic,
             mcts_prior=task.mcts_prior,
             mcts_config=task.mcts_config,
+            plan_mcts_config=task.plan_mcts_config,
             planner_threshold=task.planner_threshold,
             planner_weight=task.planner_weight,
             planner_confidence_routing=task.planner_confidence_routing,
@@ -358,6 +412,8 @@ def _run_cell(task: PanelTask) -> dict[str, Any]:
                 agent_seed0=pairing_seed,
                 agent_seed1=pairing_seed + 1,
             )
+            _reset_episode(candidate)
+            _reset_episode(opponent)
             results.append((result, candidate_player))
             all_results.append((result, candidate_player))
         seat = _summary(results)
@@ -382,6 +438,7 @@ def _run_cell(task: PanelTask) -> dict[str, Any]:
         ),
         "candidate": task.candidate.name,
         "candidate_kind": task.candidate.kind,
+        "candidate_deck": task.model_deck.name,
         "opponent": task.opponent.name,
         "opponent_kind": task.opponent.kind,
         "opponent_deck": task.opponent_deck.name,
@@ -516,6 +573,7 @@ def evaluate_meta_panel(
     games_per_seat: int,
     seed: int,
     candidates: list[str],
+    external_candidates: list[AgentSpec] | None = None,
     opponents: list[AgentSpec],
     opponent_decks: list[DeckSpec],
     official_dir: str | Path | None = None,
@@ -529,6 +587,8 @@ def evaluate_meta_panel(
     c_puct: float = 1.25,
     max_depth: int = 12,
     max_actions: int = 16,
+    plan_determinizations: int = 4,
+    plan_max_steps: int = 32,
     planner_threshold: float = 0.8,
     planner_weight: float = 4.0,
     planner_confidence_routing: bool = True,
@@ -542,10 +602,8 @@ def evaluate_meta_panel(
         raise ValueError("planner_threshold must be in [0, 1]")
     if planner_weight < 0:
         raise ValueError("planner_weight must be non-negative")
-    if not candidates or not opponents or not opponent_decks:
-        raise ValueError("candidates, opponents, and opponent_decks cannot be empty")
-    if len(candidates) != len(set(candidates)):
-        raise ValueError("candidate names must be unique")
+    if not opponents or not opponent_decks:
+        raise ValueError("opponents and opponent_decks cannot be empty")
     if len({item.name for item in opponents}) != len(opponents):
         raise ValueError("opponent names must be unique")
     if len({item.name for item in opponent_decks}) != len(opponent_decks):
@@ -568,15 +626,37 @@ def evaluate_meta_panel(
     candidate_specs = [
         AgentSpec(name, name, resolved_checkpoint) for name in candidates
     ]
+    candidate_specs.extend(external_candidates or [])
+    if not candidate_specs:
+        raise ValueError("candidates cannot be empty")
+    if len({item.name for item in candidate_specs}) != len(candidate_specs):
+        raise ValueError("candidate names must be unique")
+    candidate_decks = {
+        item.name: (
+            DeckSpec(item.name, item.deck_path)
+            if item.deck_path is not None
+            else model_deck
+        )
+        for item in candidate_specs
+    }
+    for item in candidate_decks.values():
+        OfficialEngine.load_deck(item.path)
     belief_decks = list(opponent_decks)
-    if Path(model_deck.path) not in {Path(item.path) for item in belief_decks}:
-        belief_decks.append(model_deck)
+    known_belief_paths = {Path(item.path) for item in belief_decks}
+    for item in candidate_decks.values():
+        if Path(item.path) not in known_belief_paths:
+            belief_decks.append(item)
+            known_belief_paths.add(Path(item.path))
     mcts_config = MCTSConfig(
         simulations=simulations,
         determinizations=determinizations,
         c_puct=c_puct,
         max_depth=max_depth,
         max_actions=max_actions,
+    )
+    plan_mcts_config = PlanMCTSConfig(
+        determinizations=plan_determinizations,
+        max_macro_steps=plan_max_steps,
     )
     tasks = []
     for opponent_index, opponent in enumerate(opponents):
@@ -592,7 +672,7 @@ def evaluate_meta_panel(
                     PanelTask(
                         candidate=candidate,
                         opponent=opponent,
-                        model_deck=model_deck,
+                        model_deck=candidate_decks[candidate.name],
                         opponent_deck=opponent_deck,
                         belief_decks=tuple(belief_decks),
                         games_per_seat=games_per_seat,
@@ -602,6 +682,7 @@ def evaluate_meta_panel(
                         torch_threads=torch_threads,
                         mcts_prior=mcts_prior,
                         mcts_config=mcts_config,
+                        plan_mcts_config=plan_mcts_config,
                         planner_threshold=planner_threshold,
                         planner_weight=planner_weight,
                         planner_confidence_routing=planner_confidence_routing,
@@ -638,6 +719,9 @@ def evaluate_meta_panel(
         "generated_at": datetime.now(UTC).isoformat(),
         "checkpoint": resolved_checkpoint,
         "model_deck": asdict(model_deck),
+        "candidate_decks": {
+            name: asdict(deck) for name, deck in sorted(candidate_decks.items())
+        },
         "games_per_seat": games_per_seat,
         "seed": seed,
         "action_selection": "stochastic" if stochastic else "deterministic",
@@ -645,6 +729,7 @@ def evaluate_meta_panel(
         "torch_threads_per_worker": torch_threads,
         "mcts_prior": mcts_prior,
         "mcts_config": asdict(mcts_config),
+        "plan_mcts_config": asdict(plan_mcts_config),
         "planner_threshold": planner_threshold,
         "planner_weight": planner_weight,
         "planner_confidence_routing": planner_confidence_routing,
@@ -678,8 +763,28 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--candidate",
         action="append",
-        choices=("policy", "mcts", "planner", "planner-policy", "planner-mcts"),
+        choices=(
+            "policy",
+            "mcts",
+            "planner",
+            "planner-policy",
+            "turn-planner-policy",
+            "commitment-planner-policy",
+            "mega-expert",
+            "plan-mcts",
+            "planner-mcts",
+        ),
         help="Repeat to select candidates; defaults to policy and mcts.",
+    )
+    parser.add_argument(
+        "--external-candidate",
+        action="append",
+        default=[],
+        metavar="NAME=SOURCE,DECK",
+        help=(
+            "Add an inspected public .py/.ipynb candidate with its own deck. "
+            "Repeat to create a public-agent tournament."
+        ),
     )
     parser.add_argument(
         "--opponent",
@@ -731,6 +836,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--c-puct", type=float, default=1.25)
     parser.add_argument("--max-depth", type=int, default=12)
     parser.add_argument("--max-actions", type=int, default=16)
+    parser.add_argument("--plan-determinizations", type=int, default=4)
+    parser.add_argument("--plan-max-steps", type=int, default=32)
     parser.add_argument("--planner-threshold", type=float, default=0.8)
     parser.add_argument("--planner-weight", type=float, default=4.0)
     confidence_group = parser.add_mutually_exclusive_group()
@@ -767,6 +874,10 @@ def main(argv: list[str] | None = None) -> int:
         for name in builtin_opponents
     ]
     try:
+        external_candidates = [
+            _external_agent_spec(specification, "--external-candidate")
+            for specification in args.external_candidate
+        ]
         for specification in args.policy_opponent:
             name, path = _named_path(specification, "--policy-opponent")
             opponents.append(AgentSpec(name, "policy", str(path)))
@@ -774,7 +885,7 @@ def main(argv: list[str] | None = None) -> int:
             name, path = _named_path(specification, "--mcts-opponent")
             opponents.append(AgentSpec(name, "mcts", str(path)))
         external_opponents = [
-            _external_opponent_spec(specification)
+            _external_agent_spec(specification, "--external-opponent")
             for specification in args.external_opponent
         ]
         opponents.extend(external_opponents)
@@ -803,7 +914,12 @@ def main(argv: list[str] | None = None) -> int:
         checkpoint,
         games_per_seat=args.games_per_seat,
         seed=args.seed,
-        candidates=args.candidate or ["policy", "mcts"],
+        candidates=(
+            args.candidate
+            if args.candidate is not None
+            else ([] if external_candidates else ["policy", "mcts"])
+        ),
+        external_candidates=external_candidates,
         opponents=opponents,
         opponent_decks=decks,
         official_dir=official_dir,
@@ -817,6 +933,8 @@ def main(argv: list[str] | None = None) -> int:
         c_puct=args.c_puct,
         max_depth=args.max_depth,
         max_actions=args.max_actions,
+        plan_determinizations=args.plan_determinizations,
+        plan_max_steps=args.plan_max_steps,
         planner_threshold=args.planner_threshold,
         planner_weight=args.planner_weight,
         planner_confidence_routing=args.planner_confidence_routing,

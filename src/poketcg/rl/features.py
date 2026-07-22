@@ -394,8 +394,10 @@ class FeatureEncoderV2(FeatureEncoder):
         for card in state.get("stadium") or []:
             add_card(card, kind=1, zone=1, owner=owner_id(card))
 
-        for player_index, player in enumerate(state["players"]):
-            owner = 1 if player_index == your_index else 2
+        for owner, player_index in enumerate(
+            (your_index, 1 - your_index), start=1
+        ):
+            player = state["players"][player_index]
             statuses = tuple(
                 bool(player.get(name))
                 for name in ("poisoned", "burned", "asleep", "paralyzed", "confused")
@@ -418,8 +420,10 @@ class FeatureEncoderV2(FeatureEncoder):
             add_card(card, kind=1, zone=14, owner=owner_id(card))
         for card in selection.get("deck") or []:
             add_card(card, kind=1, zone=8, owner=owner_id(card))
-        for player_index, player in enumerate(state["players"]):
-            owner = 1 if player_index == your_index else 2
+        for owner, player_index in enumerate(
+            (your_index, 1 - your_index), start=1
+        ):
+            player = state["players"][player_index]
             for card in player.get("prize") or []:
                 add_card(card, kind=1, zone=6, owner=owner)
             # The newest discard cards are usually the most decision-relevant.

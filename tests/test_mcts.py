@@ -12,6 +12,8 @@ from poketcg.mcts import (
     MCTSConfig,
     OfficialSearchBackend,
     OpponentDeckBelief,
+    PlanLevelMCTSAgent,
+    PlanMCTSConfig,
     PolicyValueMCTSAgent,
     SearchPosition,
 )
@@ -79,6 +81,9 @@ class _StubDeterminizer:
         del observation
         return HiddenStateGuess([], [], [], [], [], [])
 
+    def reset(self) -> None:
+        pass
+
 
 class _AdversarialBackend:
     """Action 0 lets player 1 choose win/loss; action 1 is a draw."""
@@ -145,6 +150,107 @@ def test_mcts_aggregates_independent_determinization_trees() -> None:
     assert agent.metrics()["determinizations"] == 4
     assert agent.metrics()["p95_elapsed_ms"] >= 0.0
     assert agent.metrics()["p99_elapsed_ms"] >= agent.metrics()["p95_elapsed_ms"]
+
+
+class _FixedExecutor:
+    def __init__(self, action: list[int]) -> None:
+        self.action = action
+        self.calls = 0
+        self.resets = 0
+
+    def reset_episode(self) -> None:
+        self.resets += 1
+
+    def choose_deterministic_action(self, observation: dict) -> list[int]:
+        del observation
+        self.calls += 1
+        return list(self.action)
+
+    def choose_action(self, observation: dict) -> list[int]:
+        return self.choose_deterministic_action(observation)
+
+
+class _MacroBackend:
+    """Local mode loses immediately; planner mode wins immediately."""
+
+    def __init__(self) -> None:
+        self.begin_count = 0
+        self.end_count = 0
+
+    def begin(self, observation: dict, hidden: HiddenStateGuess) -> SearchPosition:
+        del hidden
+        self.begin_count += 1
+        return SearchPosition(0, observation)
+
+    def step(self, search_id: int, action: list[int]) -> SearchPosition:
+        if search_id != 0:
+            raise AssertionError(search_id)
+        if action == [0]:
+            return SearchPosition(1, _plan_observation(result=1))
+        if action == [1]:
+            return SearchPosition(2, _plan_observation(result=0))
+        raise AssertionError(action)
+
+    def end(self) -> None:
+        self.end_count += 1
+
+
+def _plan_observation(
+    *,
+    player: int = 0,
+    turn: int = 3,
+    context: int = 0,
+    result: int = -1,
+) -> dict:
+    observation = _observation(player=player, result=result)
+    observation["select"]["context"] = context
+    observation["current"]["turn"] = turn
+    return observation
+
+
+def test_plan_level_mcts_selects_better_full_turn_executor() -> None:
+    local = _FixedExecutor([0])
+    planner = _FixedExecutor([1])
+    backend = _MacroBackend()
+    agent = PlanLevelMCTSAgent(
+        local,
+        planner,
+        _FakePolicy(),  # type: ignore[arg-type]
+        _StubDeterminizer(),  # type: ignore[arg-type]
+        config=PlanMCTSConfig(determinizations=3, max_macro_steps=4),
+        backend=backend,
+    )
+
+    action = agent.choose_action(_plan_observation())
+
+    assert action == [1]
+    assert backend.begin_count == 3
+    assert backend.end_count == 3
+    assert agent.last_search is not None
+    assert agent.last_search["selected_mode"] == agent.PLANNER_MODE
+    assert agent.last_search["mode_values"][agent.LOCAL_MODE]["mean"] == -1.0
+    assert agent.last_search["mode_values"][agent.PLANNER_MODE]["mean"] == 1.0
+    assert agent.metrics()["macro_rollouts"] == 6
+    assert agent.metrics()["selection_counts"] == {agent.PLANNER_MODE: 1}
+
+
+def test_plan_level_mcts_keeps_selected_executor_for_remainder_of_turn() -> None:
+    local = _FixedExecutor([0])
+    planner = _FixedExecutor([1])
+    backend = _MacroBackend()
+    agent = PlanLevelMCTSAgent(
+        local,
+        planner,
+        _FakePolicy(),  # type: ignore[arg-type]
+        _StubDeterminizer(),  # type: ignore[arg-type]
+        config=PlanMCTSConfig(determinizations=1, max_macro_steps=4),
+        backend=backend,
+    )
+
+    assert agent.choose_action(_plan_observation()) == [1]
+    searches = agent.metrics()["searches"]
+    assert agent.choose_action(_plan_observation(context=7)) == [1]
+    assert agent.metrics()["searches"] == searches
 
 
 def test_deck_determinizer_fills_every_hidden_zone() -> None:

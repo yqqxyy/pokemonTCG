@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -62,40 +63,106 @@ class ExternalPythonAgent:
         name: str,
         expected_deck: list[int] | None = None,
     ) -> None:
-        source_path = Path(source).expanduser().resolve()
-        resolved_deck = Path(deck_path).expanduser().resolve()
-        if not source_path.is_file():
-            raise FileNotFoundError(f"External agent source not found: {source_path}")
-        if not resolved_deck.is_file():
-            raise FileNotFoundError(f"External agent deck not found: {resolved_deck}")
+        self._source_path = Path(source).expanduser().resolve()
+        self._resolved_deck = Path(deck_path).expanduser().resolve()
+        if not self._source_path.is_file():
+            raise FileNotFoundError(
+                f"External agent source not found: {self._source_path}"
+            )
+        if not self._resolved_deck.is_file():
+            raise FileNotFoundError(
+                f"External agent deck not found: {self._resolved_deck}"
+            )
+        self._external_name = name
+        self._expected_deck = (
+            list(expected_deck) if expected_deck is not None else None
+        )
+        self.name = f"external-{name}"
+        self._used = False
+        self._load()
+
+    def _load(self) -> None:
         namespace: dict[str, Any] = {
-            "__file__": str(source_path),
-            "__name__": f"poketcg_external_{name}",
+            "__file__": str(self._source_path),
+            "__name__": f"poketcg_external_{self._external_name}",
         }
-        with _working_directory(resolved_deck.parent):
-            exec(compile(_agent_source(source_path), str(source_path), "exec"), namespace)
+        with _working_directory(self._resolved_deck.parent):
+            exec(
+                compile(
+                    _agent_source(self._source_path),
+                    str(self._source_path),
+                    "exec",
+                ),
+                namespace,
+            )
         choose_action = namespace.get("agent")
         if not callable(choose_action):
-            raise TypeError(f"External source does not define callable agent(...): {source_path}")
+            raise TypeError(
+                "External source does not define callable agent(...): "
+                f"{self._source_path}"
+            )
         declared_deck = namespace.get("my_deck")
         if (
-            expected_deck is not None
+            self._expected_deck is not None
             and declared_deck is not None
-            and [int(value) for value in declared_deck] != list(expected_deck)
+            and [int(value) for value in declared_deck] != self._expected_deck
         ):
             raise ValueError(
-                f"External agent {name!r} loaded a deck different from {resolved_deck}"
+                f"External agent {self._external_name!r} loaded a deck different "
+                f"from {self._resolved_deck}"
             )
-        self.name = f"external-{name}"
         self._choose_action = choose_action
         self._reset = namespace.get("reset_episode")
+        scored_function = namespace.get("_agent")
+        self._scored_function_code = (
+            scored_function.__code__ if callable(scored_function) else None
+        )
 
     def reset_episode(self) -> None:
         if callable(self._reset):
             self._reset()
+        elif self._used:
+            self._load()
+        self._used = False
 
     def choose_action(self, observation: dict) -> list[int]:
+        self._used = True
         action = self._choose_action(observation)
         if not isinstance(action, list) or not all(isinstance(index, int) for index in action):
             raise TypeError(f"{self.name} returned an action other than list[int]")
         return action
+
+    def choose_action_with_scores(self, observation: dict) -> tuple[list[int], list[float]]:
+        """Return an external scorer's action and its per-option score vector.
+
+        The audited Library-Out agent builds a local ``scores`` list inside
+        ``_agent``.  Capturing it at function return avoids maintaining a fork of
+        the public strategy solely for trajectory collection.  Agents without
+        that explicit score vector fail closed instead of fabricating priors.
+        """
+        if self._scored_function_code is None:
+            raise RuntimeError(f"{self.name} does not expose an auditable _agent scorer")
+        captured: list[float] | None = None
+        previous_trace = sys.gettrace()
+
+        def trace(frame, event, _argument):
+            nonlocal captured
+            if event == "return" and frame.f_code is self._scored_function_code:
+                raw_scores = frame.f_locals.get("scores")
+                if isinstance(raw_scores, list) and all(
+                    isinstance(value, int | float) for value in raw_scores
+                ):
+                    captured = [float(value) for value in raw_scores]
+            return trace
+
+        sys.settrace(trace)
+        try:
+            action = self.choose_action(observation)
+        finally:
+            sys.settrace(previous_trace)
+        option_count = len(observation.get("select", {}).get("option", []))
+        if captured is None or len(captured) != option_count:
+            raise RuntimeError(
+                f"{self.name} did not expose one score for each legal option"
+            )
+        return action, captured

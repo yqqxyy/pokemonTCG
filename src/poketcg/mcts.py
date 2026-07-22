@@ -65,6 +65,14 @@ class SearchBackend(Protocol):
     def end(self) -> None: ...
 
 
+class MacroExecutor(Protocol):
+    """Stateful policy used to execute one complete root-player turn."""
+
+    def choose_action(self, observation: dict) -> list[int]: ...
+
+    def reset_episode(self) -> None: ...
+
+
 class OfficialSearchBackend:
     """Thin adapter around ``cg.api`` that keeps the rest of MCTS testable."""
 
@@ -386,6 +394,21 @@ class MCTSConfig:
             raise ValueError("c_puct must be non-negative")
         if self.max_depth <= 0 or self.max_actions <= 0:
             raise ValueError("max_depth and max_actions must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class PlanMCTSConfig:
+    """Budget for root-level Monte Carlo comparison of complete turn plans."""
+
+    determinizations: int = 4
+    max_macro_steps: int = 32
+    root_contexts: tuple[int, ...] = (0,)
+
+    def __post_init__(self) -> None:
+        if self.determinizations <= 0:
+            raise ValueError("determinizations must be positive")
+        if self.max_macro_steps <= 0:
+            raise ValueError("max_macro_steps must be positive")
 
 
 @dataclass(slots=True)
@@ -727,3 +750,351 @@ class PolicyValueMCTSAgent:
         self._opponent_deck_samples.update(hypotheses)
         self._deepest = max(self._deepest, int(stats["max_depth_reached"]))
         return list(selected_action)
+
+
+class PlanLevelMCTSAgent:
+    """Choose a full-turn executor by evaluating macro rollouts from one root.
+
+    V0 exhaustively compares the robust local PlannerPolicy executor against the
+    specialist TacticalPlanner executor for each sampled determinization. The
+    selected executor then owns the real turn, so downstream actions match the
+    branch that was evaluated even when both branches share the same first action.
+    """
+
+    name = "plan-level-mcts"
+    LOCAL_MODE = "local_router_turn"
+    PLANNER_MODE = "planner_turn"
+
+    def __init__(
+        self,
+        local_executor: MacroExecutor,
+        planner_executor: MacroExecutor,
+        value_policy: BCPolicyAgent,
+        determinizer: DeckDeterminizer,
+        *,
+        config: PlanMCTSConfig | None = None,
+        backend: SearchBackend | None = None,
+    ) -> None:
+        self._executors = {
+            self.LOCAL_MODE: local_executor,
+            self.PLANNER_MODE: planner_executor,
+        }
+        self._value_policy = value_policy
+        self._determinizer = determinizer
+        self._config = config or PlanMCTSConfig()
+        self._backend = backend or OfficialSearchBackend()
+        self._active_mode: str | None = None
+        self._active_turn: int | None = None
+        self._active_player: int | None = None
+        self.last_search: dict[str, Any] | None = None
+        self._search_count = 0
+        self._total_elapsed_ms = 0.0
+        self._total_rollouts = 0
+        self._total_macro_steps = 0
+        self._max_macro_steps_reached = 0
+        self._selection_counts: Counter[str] = Counter()
+        self._mode_value_sums: Counter[str] = Counter()
+        self._mode_value_counts: Counter[str] = Counter()
+        self._boundary_counts: dict[str, Counter[str]] = {
+            mode: Counter() for mode in self._executors
+        }
+        self._selection_margin_sum = 0.0
+        self._near_tie_searches = 0
+        self._same_first_action_searches = 0
+        self._opponent_deck_samples: Counter[str] = Counter()
+        self._errors: Counter[str] = Counter()
+        self._elapsed_samples_ms: deque[float] = deque(maxlen=50_000)
+
+    @staticmethod
+    def _reset_executor(executor: MacroExecutor) -> None:
+        reset = getattr(executor, "reset_episode", None)
+        if reset is not None:
+            reset()
+
+    @staticmethod
+    def _choose_executor_action(
+        executor: MacroExecutor, observation: dict
+    ) -> list[int]:
+        deterministic = getattr(executor, "choose_deterministic_action", None)
+        if deterministic is not None:
+            return deterministic(observation)
+        return executor.choose_action(observation)
+
+    @staticmethod
+    def _terminal_value(observation: dict, root_player: int) -> float | None:
+        return PolicyValueMCTSAgent._terminal_value(observation, root_player)
+
+    def _endpoint_value(self, observation: dict, root_player: int) -> float:
+        terminal = self._terminal_value(observation, root_player)
+        if terminal is not None:
+            return terminal
+        evaluation = self._value_policy.evaluate(observation)
+        player = int(observation["current"]["yourIndex"])
+        return evaluation.value if player == root_player else -evaluation.value
+
+    def _rollout(
+        self,
+        root: SearchPosition,
+        *,
+        mode: str,
+        root_player: int,
+        root_turn: int,
+    ) -> dict[str, Any]:
+        executor = self._executors[mode]
+        self._reset_executor(executor)
+        position = root
+        first_action: list[int] | None = None
+        steps = 0
+        boundary = "max_steps"
+
+        while steps < self._config.max_macro_steps:
+            observation = position.observation
+            terminal = self._terminal_value(observation, root_player)
+            if terminal is not None:
+                boundary = "terminal"
+                break
+            state = observation["current"]
+            if (
+                int(state["yourIndex"]) != root_player
+                or int(state["turn"]) != root_turn
+            ):
+                boundary = "turn_changed"
+                break
+            action = self._choose_executor_action(executor, observation)
+            if first_action is None:
+                first_action = list(action)
+            position = self._backend.step(position.search_id, action)
+            steps += 1
+
+        return {
+            "value": self._endpoint_value(position.observation, root_player),
+            "steps": steps,
+            "boundary": boundary,
+            "first_action": first_action,
+        }
+
+    def reset_episode(self) -> None:
+        self._active_mode = None
+        self._active_turn = None
+        self._active_player = None
+        self._determinizer.reset()
+        for executor in self._executors.values():
+            self._reset_executor(executor)
+
+    def metrics(self) -> dict[str, Any]:
+        searches = max(self._search_count, 1)
+
+        def percentile(fraction: float) -> float:
+            if not self._elapsed_samples_ms:
+                return 0.0
+            ordered = sorted(self._elapsed_samples_ms)
+            position = fraction * (len(ordered) - 1)
+            lower = int(position)
+            upper = min(lower + 1, len(ordered) - 1)
+            weight = position - lower
+            return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+        return {
+            "searches": self._search_count,
+            "macro_rollouts": self._total_rollouts,
+            "mean_rollouts_per_search": round(self._total_rollouts / searches, 3),
+            "macro_steps": self._total_macro_steps,
+            "mean_macro_steps_per_rollout": round(
+                self._total_macro_steps / max(self._total_rollouts, 1), 3
+            ),
+            "max_macro_steps_reached": self._max_macro_steps_reached,
+            "selection_counts": dict(sorted(self._selection_counts.items())),
+            "mean_value_by_mode": {
+                mode: round(
+                    self._mode_value_sums[mode]
+                    / max(self._mode_value_counts[mode], 1),
+                    6,
+                )
+                for mode in self._executors
+            },
+            "mean_selection_margin": round(
+                self._selection_margin_sum / searches, 6
+            ),
+            "near_tie_searches": self._near_tie_searches,
+            "near_tie_rate": round(self._near_tie_searches / searches, 6),
+            "same_first_action_searches": self._same_first_action_searches,
+            "same_first_action_rate": round(
+                self._same_first_action_searches / searches, 6
+            ),
+            "boundaries": {
+                mode: dict(sorted(counts.items()))
+                for mode, counts in self._boundary_counts.items()
+            },
+            "mean_elapsed_ms": round(self._total_elapsed_ms / searches, 3),
+            "p50_elapsed_ms": round(percentile(0.50), 3),
+            "p95_elapsed_ms": round(percentile(0.95), 3),
+            "p99_elapsed_ms": round(percentile(0.99), 3),
+            "max_elapsed_ms": round(max(self._elapsed_samples_ms, default=0.0), 3),
+            "opponent_deck_samples": dict(
+                sorted(self._opponent_deck_samples.items())
+            ),
+            "errors": dict(sorted(self._errors.items())),
+        }
+
+    def _search_modes(self, observation: dict) -> str:
+        started = perf_counter()
+        root_player = int(observation["current"]["yourIndex"])
+        root_turn = int(observation["current"]["turn"])
+        mode_values: dict[str, list[float]] = {
+            mode: [] for mode in self._executors
+        }
+        mode_steps: dict[str, list[int]] = {mode: [] for mode in self._executors}
+        boundaries: dict[str, Counter[str]] = {
+            mode: Counter() for mode in self._executors
+        }
+        first_actions: dict[str, Counter[tuple[int, ...]]] = {
+            mode: Counter() for mode in self._executors
+        }
+        hypotheses: Counter[str] = Counter()
+
+        for _ in range(self._config.determinizations):
+            hidden = self._determinizer.sample(observation)
+            if hidden.opponent_deck_name is not None:
+                hypotheses[hidden.opponent_deck_name] += 1
+            began = False
+            try:
+                root = self._backend.begin(observation, hidden)
+                began = True
+                for mode in self._executors:
+                    try:
+                        result = self._rollout(
+                            root,
+                            mode=mode,
+                            root_player=root_player,
+                            root_turn=root_turn,
+                        )
+                    except Exception as error:
+                        error_name = type(error).__name__
+                        self._errors[f"{mode}:{error_name}"] += 1
+                        mode_values[mode].append(-1.0)
+                        mode_steps[mode].append(0)
+                        boundaries[mode][f"error:{error_name}"] += 1
+                        continue
+                    mode_values[mode].append(float(result["value"]))
+                    steps = int(result["steps"])
+                    mode_steps[mode].append(steps)
+                    boundaries[mode][str(result["boundary"])] += 1
+                    first_action = result["first_action"]
+                    if first_action is not None:
+                        first_actions[mode][tuple(first_action)] += 1
+            finally:
+                if began:
+                    self._backend.end()
+
+        mean_values = {
+            mode: sum(values) / len(values) if values else -1.0
+            for mode, values in mode_values.items()
+        }
+        # Prefer the robust local router when the estimated values tie.
+        selected_mode = max(
+            self._executors,
+            key=lambda mode: (
+                mean_values[mode],
+                mode == self.LOCAL_MODE,
+            ),
+        )
+        elapsed_ms = (perf_counter() - started) * 1_000
+        self.last_search = {
+            "selected_mode": selected_mode,
+            "mode_values": {
+                mode: {
+                    "mean": round(mean_values[mode], 6),
+                    "samples": [round(value, 6) for value in mode_values[mode]],
+                    "mean_steps": round(
+                        sum(mode_steps[mode]) / max(len(mode_steps[mode]), 1), 3
+                    ),
+                    "boundaries": dict(sorted(boundaries[mode].items())),
+                    "first_actions": [
+                        {"action": list(action), "count": count}
+                        for action, count in first_actions[mode].most_common()
+                    ],
+                }
+                for mode in self._executors
+            },
+            "determinizations": self._config.determinizations,
+            "opponent_deck_samples": dict(sorted(hypotheses.items())),
+            "elapsed_ms": round(elapsed_ms, 3),
+        }
+        rollouts = self._config.determinizations * len(self._executors)
+        macro_steps = sum(sum(values) for values in mode_steps.values())
+        self._search_count += 1
+        self._total_elapsed_ms += elapsed_ms
+        self._elapsed_samples_ms.append(elapsed_ms)
+        self._total_rollouts += rollouts
+        self._total_macro_steps += macro_steps
+        self._max_macro_steps_reached = max(
+            self._max_macro_steps_reached,
+            max((max(values, default=0) for values in mode_steps.values()), default=0),
+        )
+        self._selection_counts[selected_mode] += 1
+        margin = abs(
+            mean_values[self.PLANNER_MODE] - mean_values[self.LOCAL_MODE]
+        )
+        self._selection_margin_sum += margin
+        self._near_tie_searches += int(margin < 0.05)
+        for mode, values in mode_values.items():
+            self._mode_value_sums[mode] += sum(values)
+            self._mode_value_counts[mode] += len(values)
+            self._boundary_counts[mode].update(boundaries[mode])
+        leading_actions = {
+            mode: counts.most_common(1)[0][0] if counts else None
+            for mode, counts in first_actions.items()
+        }
+        self._same_first_action_searches += int(
+            leading_actions[self.LOCAL_MODE]
+            == leading_actions[self.PLANNER_MODE]
+        )
+        self._opponent_deck_samples.update(hypotheses)
+        return selected_mode
+
+    def choose_action(self, observation: dict) -> list[int]:
+        selection = observation.get("select")
+        if selection is None:
+            raise ValueError("Plan-level MCTS received the initial deck selection")
+        state = observation["current"]
+        turn = int(state["turn"])
+        player = int(state["yourIndex"])
+
+        if self._active_mode is not None and (
+            turn != self._active_turn or player != self._active_player
+        ):
+            self._active_mode = None
+            self._active_turn = None
+            self._active_player = None
+
+        if self._active_mode is not None:
+            return self._choose_executor_action(
+                self._executors[self._active_mode], observation
+            )
+
+        legal_count = legal_action_set_count(
+            len(selection["option"]),
+            int(selection["minCount"]),
+            int(selection["maxCount"]),
+        )
+        if (
+            legal_count <= 1
+            or int(selection["context"]) not in self._config.root_contexts
+        ):
+            self.last_search = None
+            return self._choose_executor_action(
+                self._executors[self.LOCAL_MODE], observation
+            )
+
+        selected_mode = self._search_modes(observation)
+        for executor in self._executors.values():
+            self._reset_executor(executor)
+        self._active_mode = selected_mode
+        self._active_turn = turn
+        self._active_player = player
+        action = self._choose_executor_action(
+            self._executors[selected_mode], observation
+        )
+        if self.last_search is not None:
+            self.last_search["selected_action"] = list(action)
+        return action

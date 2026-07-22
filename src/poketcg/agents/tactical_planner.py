@@ -7,6 +7,7 @@ import random
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any
 
 import torch
@@ -103,6 +104,34 @@ class PlannerEvaluation:
     plan: TacticalPlan | None
 
 
+class TurnOwner(StrEnum):
+    """Component responsible for every decision in one complete turn."""
+
+    PLANNER = "planner"
+    POLICY = "policy"
+
+
+class OwnershipScope(StrEnum):
+    """How long a routing decision remains authoritative."""
+
+    CHAIN = "resolver_chain"
+    TURN = "committed_turn"
+
+
+@dataclass(slots=True)
+class TurnOwnershipState:
+    """Mutable lifecycle state for one owned decision segment."""
+
+    turn: int
+    player: int
+    initial_owner: TurnOwner
+    owner: TurnOwner
+    route_reason: str
+    plan: TacticalPlan | None
+    scope: OwnershipScope = OwnershipScope.TURN
+    decisions: int = 0
+
+
 @dataclass(frozen=True, slots=True)
 class _Attacker:
     pokemon: dict
@@ -176,6 +205,94 @@ class TacticalPlannerAgent:
         self._plan = None
         self._turn = -1
 
+    def clear_plan(self) -> None:
+        """Invalidate the cached plan without resetting aggregate metrics."""
+        self._plan = None
+
+    def plan_is_valid(
+        self,
+        observation: dict,
+        plan: TacticalPlan | None = None,
+    ) -> bool:
+        """Check whether the persistent attacker and target still exist this turn."""
+        candidate = self._plan if plan is None else plan
+        if candidate is None:
+            return True
+        state = observation["current"]
+        if int(state["turn"]) != candidate.turn:
+            return False
+        player_index = int(state["yourIndex"])
+        own_cards = [card for _, _, card in _field(state["players"][player_index])]
+        opponent_cards = [
+            card for _, _, card in _field(state["players"][1 - player_index])
+        ]
+
+        def exists(
+            cards: list[dict],
+            serial: int | None,
+            card_ids: set[int | None],
+        ) -> bool:
+            if serial is not None:
+                return any(_serial(card) == serial for card in cards)
+            valid_ids = {card_id for card_id in card_ids if card_id is not None}
+            return bool(valid_ids) and any(_card_id(card) in valid_ids for card in cards)
+
+        attacker_exists = exists(
+            own_cards,
+            candidate.attacker_serial,
+            {candidate.attacker_card_id, candidate.evolve_card_id},
+        )
+        target_exists = exists(
+            opponent_cards,
+            candidate.target_serial,
+            {candidate.target_card_id},
+        )
+        return attacker_exists and target_exists
+
+    def is_plan_commitment(
+        self,
+        observation: dict,
+        evaluation: PlannerEvaluation,
+    ) -> bool:
+        """Whether the selected MAIN action materially commits to its attack plan."""
+        plan = evaluation.plan
+        if plan is None:
+            return False
+        for index in evaluation.action:
+            option = observation["select"]["option"][index]
+            option_type = int(option["type"])
+            card_id = self._option_card_id(observation, option)
+            target = self._target_pokemon(observation, option)
+            if (
+                option_type == int(OptionType.ATTACK)
+                and int(option.get("attackId") or 0) == plan.attack_id
+            ):
+                return True
+            if (
+                option_type == int(OptionType.EVOLVE)
+                and card_id == plan.evolve_card_id
+                and self._matches_serial(target, plan.attacker_serial)
+            ):
+                return True
+            if (
+                option_type == int(OptionType.ATTACH)
+                and card_id == self.profile.energy_id
+                and plan.energy_missing > 0
+                and self._matches_serial(target, plan.attacker_serial)
+            ):
+                return True
+            if option_type == int(OptionType.RETREAT) and plan.requires_switch:
+                return True
+            if option_type != int(OptionType.PLAY):
+                continue
+            if card_id == self.profile.switch_id and plan.requires_switch:
+                return True
+            if card_id == self.profile.gust_id and plan.requires_gust:
+                return True
+            if card_id == self.profile.damage_boost_id and plan.needs_damage_boost:
+                return True
+        return False
+
     def metrics(self) -> dict[str, float | int]:
         decisions = max(self._decisions, 1)
         return {
@@ -241,9 +358,17 @@ class TacticalPlannerAgent:
 
         local_plan = self._build_plan(observation)
         if context == int(SelectContext.MAIN):
-            plan = local_plan
-            if persist:
-                self._plan = plan
+            if (
+                persist
+                and self._plan is not None
+                and self._plan.turn == turn
+                and self.plan_is_valid(observation, self._plan)
+            ):
+                plan = self._plan
+            else:
+                plan = local_plan
+                if persist:
+                    self._plan = plan
         elif persist and self._plan is not None and self._plan.turn == turn:
             plan = self._plan
         else:
@@ -912,6 +1037,8 @@ class PlannerPolicyAgent:
         planner_threshold: float = 0.7,
         planner_weight: float = 4.0,
         confidence_routing: bool = True,
+        turn_ownership: bool = False,
+        commitment_ownership: bool = False,
         deterministic: bool = True,
         seed: int | None = None,
     ) -> None:
@@ -919,33 +1046,128 @@ class PlannerPolicyAgent:
             raise ValueError("planner_threshold must be in [0, 1]")
         if planner_weight < 0:
             raise ValueError("planner_weight must be non-negative")
+        if turn_ownership and commitment_ownership:
+            raise ValueError(
+                "turn_ownership and commitment_ownership are mutually exclusive"
+            )
         self._policy = policy
         self._planner = planner
         self._threshold = planner_threshold
         self._weight = planner_weight
         self._confidence_routing = confidence_routing
+        self._turn_ownership = turn_ownership
+        self._commitment_ownership = commitment_ownership
         self._deterministic = deterministic
         self._rng = random.Random(seed)
+        if commitment_ownership:
+            self.name = "commitment-planner-policy"
+        elif turn_ownership:
+            self.name = "turn-planner-policy"
+        else:
+            self.name = "planner-policy"
         self._planner_routes = 0
         self._policy_routes = 0
         self._route_reasons: Counter[str] = Counter()
+        self._ownership: TurnOwnershipState | None = None
+        self._owned_turns = 0
+        self._planner_owned_turns = 0
+        self._policy_owned_turns = 0
+        self._completed_owned_turns = 0
+        self._owner_switches = 0
+        self._plan_invalidations = 0
+        self._planner_owned_decisions = 0
+        self._policy_owned_decisions = 0
+        self._completion_reasons: Counter[str] = Counter()
+        self._ownership_scopes: Counter[str] = Counter()
+        self._chain_resolutions = 0
 
     @property
     def action_space_version(self) -> int:
         return self._policy.action_space_version
 
     def reset_episode(self) -> None:
+        self._complete_owned_turn("episode_reset")
         self._planner.reset_episode()
 
     def metrics(self) -> dict[str, Any]:
-        total = max(self._planner_routes + self._policy_routes, 1)
-        return {
+        routed_total = max(self._planner_routes + self._policy_routes, 1)
+        owned_turns = max(self._owned_turns, 1)
+        ownership_decisions = max(
+            self._planner_owned_decisions + self._policy_owned_decisions, 1
+        )
+        result = {
             "planner_routes": self._planner_routes,
             "policy_routes": self._policy_routes,
-            "planner_route_rate": round(self._planner_routes / total, 6),
+            "planner_route_rate": round(self._planner_routes / routed_total, 6),
             "planner_route_reasons": dict(sorted(self._route_reasons.items())),
             "planner": self._planner.metrics(),
+            "turn_ownership_enabled": self._turn_ownership,
+            "commitment_ownership_enabled": self._commitment_ownership,
         }
+        if self._turn_ownership:
+            result["turn_ownership"] = {
+                "owned_turns": self._owned_turns,
+                "planner_owned_turns": self._planner_owned_turns,
+                "policy_owned_turns": self._policy_owned_turns,
+                "planner_owned_rate": round(
+                    self._planner_owned_turns / owned_turns, 6
+                ),
+                "completed_owned_turns": self._completed_owned_turns,
+                "completion_rate": round(
+                    self._completed_owned_turns / owned_turns, 6
+                ),
+                "completion_reasons": dict(sorted(self._completion_reasons.items())),
+                "owner_switches": self._owner_switches,
+                "owner_switches_per_turn": round(
+                    self._owner_switches / owned_turns, 6
+                ),
+                "plan_invalidations": self._plan_invalidations,
+                "planner_owned_decisions": self._planner_owned_decisions,
+                "policy_owned_decisions": self._policy_owned_decisions,
+                "planner_owned_decision_rate": round(
+                    self._planner_owned_decisions / ownership_decisions, 6
+                ),
+                "active_turn": self._ownership.turn if self._ownership else None,
+                "active_owner": (
+                    self._ownership.owner.value if self._ownership else None
+                ),
+            }
+        if self._commitment_ownership:
+            result["commitment_ownership"] = {
+                "ownership_segments": self._owned_turns,
+                "planner_segments": self._planner_owned_turns,
+                "policy_segments": self._policy_owned_turns,
+                "planner_segment_rate": round(
+                    self._planner_owned_turns / owned_turns, 6
+                ),
+                "resolver_chains": self._ownership_scopes[
+                    OwnershipScope.CHAIN.value
+                ],
+                "committed_turns": self._ownership_scopes[
+                    OwnershipScope.TURN.value
+                ],
+                "chain_resolutions": self._chain_resolutions,
+                "completed_segments": self._completed_owned_turns,
+                "completion_rate": round(
+                    self._completed_owned_turns / owned_turns, 6
+                ),
+                "completion_reasons": dict(sorted(self._completion_reasons.items())),
+                "owner_switches": self._owner_switches,
+                "plan_invalidations": self._plan_invalidations,
+                "planner_owned_decisions": self._planner_owned_decisions,
+                "policy_owned_decisions": self._policy_owned_decisions,
+                "planner_owned_decision_rate": round(
+                    self._planner_owned_decisions / ownership_decisions, 6
+                ),
+                "active_turn": self._ownership.turn if self._ownership else None,
+                "active_owner": (
+                    self._ownership.owner.value if self._ownership else None
+                ),
+                "active_scope": (
+                    self._ownership.scope.value if self._ownership else None
+                ),
+            }
+        return result
 
     def evaluate(self, observation: dict) -> PolicyValueEvaluation:
         neural = self._policy.evaluate(observation)
@@ -963,6 +1185,13 @@ class PlannerPolicyAgent:
         )
 
     def choose_action(self, observation: dict) -> list[int]:
+        if self._commitment_ownership:
+            return self._choose_commitment_action(observation)
+        if self._turn_ownership:
+            return self._choose_owned_action(observation)
+        return self._choose_routed_action(observation)
+
+    def _choose_routed_action(self, observation: dict) -> list[int]:
         planned = self._planner.evaluate(observation, persist=True)
         route_reason = self._planner.routing_reason(
             observation,
@@ -984,3 +1213,230 @@ class PlannerPolicyAgent:
             evaluation.maximum,
             rng=self._rng,
         )
+
+    def choose_deterministic_action(self, observation: dict) -> list[int]:
+        """Execute legacy routing with a deterministic neural fallback."""
+        planned = self._planner.evaluate(observation, persist=True)
+        route_reason = self._planner.routing_reason(
+            observation,
+            planned,
+            threshold=self._threshold,
+            allow_confidence=self._confidence_routing,
+        )
+        if route_reason is not None:
+            self._planner_routes += 1
+            self._route_reasons[route_reason] += 1
+            return list(planned.action)
+        self._policy_routes += 1
+        choose = getattr(self._policy, "choose_deterministic_action", None)
+        if choose is not None:
+            return choose(observation)
+        evaluation = self._policy.evaluate(observation)
+        return deterministic_subset(
+            evaluation.logits,
+            evaluation.minimum,
+            evaluation.maximum,
+        )
+
+    def _choose_policy_action(self, observation: dict) -> list[int]:
+        return self._policy.choose_action(observation)
+
+    def _complete_owned_turn(self, reason: str) -> None:
+        if self._ownership is None:
+            return
+        self._completed_owned_turns += 1
+        self._completion_reasons[reason] += 1
+        self._ownership = None
+
+    def _begin_owned_turn(
+        self,
+        observation: dict,
+        planned: PlannerEvaluation,
+        route_reason: str | None,
+        *,
+        scope: OwnershipScope = OwnershipScope.TURN,
+    ) -> None:
+        state = observation["current"]
+        owner = TurnOwner.PLANNER if route_reason is not None else TurnOwner.POLICY
+        self._ownership = TurnOwnershipState(
+            turn=int(state["turn"]),
+            player=int(state["yourIndex"]),
+            initial_owner=owner,
+            owner=owner,
+            route_reason=route_reason or "policy:turn-start",
+            plan=planned.plan,
+            scope=scope,
+        )
+        self._owned_turns += 1
+        self._ownership_scopes[scope.value] += 1
+        if owner is TurnOwner.PLANNER:
+            self._planner_owned_turns += 1
+        else:
+            self._policy_owned_turns += 1
+
+    def _record_owned_decision(self, owner: TurnOwner, reason: str) -> None:
+        if self._ownership is None:
+            raise RuntimeError("Cannot record a decision without active ownership")
+        self._ownership.decisions += 1
+        if owner is TurnOwner.PLANNER:
+            self._planner_routes += 1
+            self._planner_owned_decisions += 1
+        else:
+            self._policy_routes += 1
+            self._policy_owned_decisions += 1
+        self._route_reasons[reason] += 1
+
+    def _choose_owned_action(self, observation: dict) -> list[int]:
+        state = observation["current"]
+        turn = int(state["turn"])
+        player = int(state["yourIndex"])
+        context = int(observation["select"]["context"])
+
+        if self._ownership is not None and (
+            self._ownership.turn != turn or self._ownership.player != player
+        ):
+            self._complete_owned_turn("turn_changed")
+
+        # Setup and forced promotion contexts can occur before the first MAIN
+        # decision. They retain legacy per-decision routing and do not claim a turn.
+        if self._ownership is None and context != int(SelectContext.MAIN):
+            return self._choose_routed_action(observation)
+
+        if self._ownership is None:
+            planned = self._planner.evaluate(observation, persist=True)
+            route_reason = self._planner.routing_reason(
+                observation,
+                planned,
+                threshold=self._threshold,
+                allow_confidence=self._confidence_routing,
+            )
+            self._begin_owned_turn(observation, planned, route_reason)
+            if self._ownership is None:
+                raise AssertionError("Turn ownership failed to initialize")
+            if self._ownership.owner is TurnOwner.PLANNER:
+                self._record_owned_decision(
+                    TurnOwner.PLANNER,
+                    f"turn-start:{route_reason}",
+                )
+                return list(planned.action)
+            self._record_owned_decision(TurnOwner.POLICY, "turn-start:policy")
+            return self._choose_policy_action(observation)
+
+        ownership = self._ownership
+        if (
+            ownership.owner is TurnOwner.PLANNER
+            and context == int(SelectContext.MAIN)
+            and not self._planner.plan_is_valid(observation, ownership.plan)
+        ):
+            ownership.owner = TurnOwner.POLICY
+            self._owner_switches += 1
+            self._plan_invalidations += 1
+            self._planner.clear_plan()
+
+        if ownership.owner is TurnOwner.PLANNER:
+            planned = self._planner.evaluate(observation, persist=True)
+            if planned.plan is not None:
+                ownership.plan = planned.plan
+            self._record_owned_decision(TurnOwner.PLANNER, "ownership:planner")
+            return list(planned.action)
+
+        reason = (
+            "ownership:policy-after-invalidation"
+            if ownership.initial_owner is TurnOwner.PLANNER
+            else "ownership:policy"
+        )
+        self._record_owned_decision(TurnOwner.POLICY, reason)
+        return self._choose_policy_action(observation)
+
+    def _choose_commitment_action(self, observation: dict) -> list[int]:
+        state = observation["current"]
+        turn = int(state["turn"])
+        player = int(state["yourIndex"])
+        context = int(observation["select"]["context"])
+
+        if self._ownership is not None and (
+            self._ownership.turn != turn or self._ownership.player != player
+        ):
+            self._complete_owned_turn("turn_changed")
+
+        if (
+            self._ownership is not None
+            and self._ownership.scope is OwnershipScope.CHAIN
+            and context == int(SelectContext.MAIN)
+        ):
+            self._chain_resolutions += 1
+            self._complete_owned_turn("chain_resolved")
+
+        # Setup and forced promotion happen outside a MAIN-triggered resolver chain.
+        if self._ownership is None and context != int(SelectContext.MAIN):
+            return self._choose_routed_action(observation)
+
+        if self._ownership is None:
+            planned = self._planner.evaluate(observation, persist=True)
+            route_reason = self._planner.routing_reason(
+                observation,
+                planned,
+                threshold=self._threshold,
+                allow_confidence=self._confidence_routing,
+            )
+            if route_reason is not None:
+                scope = (
+                    OwnershipScope.TURN
+                    if self._planner.is_plan_commitment(observation, planned)
+                    else OwnershipScope.CHAIN
+                )
+                self._begin_owned_turn(
+                    observation,
+                    planned,
+                    route_reason,
+                    scope=scope,
+                )
+                reason = (
+                    f"commitment-start:{route_reason}"
+                    if scope is OwnershipScope.TURN
+                    else f"chain-start:{route_reason}"
+                )
+                self._record_owned_decision(TurnOwner.PLANNER, reason)
+                return list(planned.action)
+
+            self._begin_owned_turn(
+                observation,
+                planned,
+                route_reason,
+                scope=OwnershipScope.CHAIN,
+            )
+            self._record_owned_decision(TurnOwner.POLICY, "chain-start:policy")
+            return self._choose_policy_action(observation)
+
+        ownership = self._ownership
+        if (
+            ownership.scope is OwnershipScope.TURN
+            and ownership.owner is TurnOwner.PLANNER
+            and context == int(SelectContext.MAIN)
+            and not self._planner.plan_is_valid(observation, ownership.plan)
+        ):
+            ownership.owner = TurnOwner.POLICY
+            self._owner_switches += 1
+            self._plan_invalidations += 1
+            self._planner.clear_plan()
+
+        if ownership.owner is TurnOwner.PLANNER:
+            planned = self._planner.evaluate(observation, persist=True)
+            if planned.plan is not None:
+                ownership.plan = planned.plan
+            reason = (
+                "commitment:planner"
+                if ownership.scope is OwnershipScope.TURN
+                else "chain:planner"
+            )
+            self._record_owned_decision(TurnOwner.PLANNER, reason)
+            return list(planned.action)
+
+        reason = (
+            "commitment:policy-after-invalidation"
+            if ownership.scope is OwnershipScope.TURN
+            and ownership.initial_owner is TurnOwner.PLANNER
+            else "chain:policy"
+        )
+        self._record_owned_decision(TurnOwner.POLICY, reason)
+        return self._choose_policy_action(observation)

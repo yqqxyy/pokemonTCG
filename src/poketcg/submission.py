@@ -8,6 +8,7 @@ import json
 import shutil
 import tarfile
 import tempfile
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +60,40 @@ def _archive_members(archive_path: Path) -> set[str]:
         return {member.name for member in archive.getmembers() if member.isfile()}
 
 
+def _belief_hypotheses(
+    specifications: Sequence[tuple[str, str | Path]] | None,
+) -> list[dict[str, Any]]:
+    """Load named opponent decks into the small JSON runtime configuration."""
+    hypotheses: list[dict[str, Any]] = []
+    names: set[str] = set()
+    for raw_name, raw_path in specifications or ():
+        name = str(raw_name).strip()
+        if not name:
+            raise ValueError("Belief deck names cannot be empty")
+        if name in names:
+            raise ValueError(f"Duplicate belief deck name: {name!r}")
+        names.add(name)
+        path = Path(raw_path).expanduser().resolve()
+        hypotheses.append(
+            {
+                "name": name,
+                "deck": OfficialEngine.load_deck(path),
+                "prior": 1.0,
+            }
+        )
+    return hypotheses
+
+
+def _named_path(value: str, option: str) -> tuple[str, Path]:
+    name, separator, raw_path = value.partition("=")
+    if not separator or not name.strip() or not raw_path.strip():
+        raise ValueError(f"{option} expects NAME=PATH; received {value!r}")
+    path = Path(raw_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"{option} path not found: {path}")
+    return name.strip(), path
+
+
 def build_submission(
     checkpoint: str | Path,
     output: str | Path,
@@ -70,11 +105,19 @@ def build_submission(
     mcts_c_puct: float = 1.25,
     mcts_max_depth: int = 12,
     mcts_max_actions: int = 16,
+    plan_mcts: bool = False,
+    plan_determinizations: int = 4,
+    plan_max_steps: int = 32,
+    plan_mcts_prior: str = "fixed-model",
+    opponent_belief_decks: Sequence[tuple[str, str | Path]] | None = None,
+    mega_expert: bool = False,
     tactical_planner: bool = False,
     planner_only: bool = False,
     planner_threshold: float = 0.8,
     planner_weight: float = 4.0,
     planner_confidence_routing: bool = True,
+    planner_turn_ownership: bool = False,
+    planner_commitment_ownership: bool = False,
 ) -> dict[str, Any]:
     """Create and validate a root-layout ``submission.tar.gz`` archive."""
     checkpoint_path = Path(checkpoint).expanduser().resolve()
@@ -97,14 +140,60 @@ def build_submission(
         raise ValueError("mcts_c_puct must be non-negative")
     if mcts_max_depth <= 0 or mcts_max_actions <= 0:
         raise ValueError("MCTS depth and action limits must be positive")
+    if plan_determinizations <= 0 or plan_max_steps <= 0:
+        raise ValueError("Plan-level MCTS budgets must be positive")
+    if plan_mcts_prior not in {"fixed-model", "belief"}:
+        raise ValueError("plan_mcts_prior must be 'fixed-model' or 'belief'")
+    belief_hypotheses = _belief_hypotheses(opponent_belief_decks)
+    if not plan_mcts and (plan_mcts_prior != "fixed-model" or belief_hypotheses):
+        raise ValueError("Opponent belief decks require plan_mcts")
+    if plan_mcts_prior == "belief" and not belief_hypotheses:
+        raise ValueError("belief prior requires at least one opponent belief deck")
+    if plan_mcts_prior == "fixed-model" and belief_hypotheses:
+        raise ValueError("Opponent belief decks require plan_mcts_prior='belief'")
+    if plan_mcts and mcts_simulations:
+        raise ValueError("plan_mcts cannot be combined with atomic MCTS")
+    if mega_expert and (
+        mcts_simulations
+        or plan_mcts
+        or tactical_planner
+        or planner_only
+        or planner_turn_ownership
+        or planner_commitment_ownership
+    ):
+        raise ValueError("mega_expert standalone mode cannot be combined with other modes")
     if not 0.0 <= planner_threshold <= 1.0:
         raise ValueError("planner_threshold must be in [0, 1]")
     if planner_weight < 0:
         raise ValueError("planner_weight must be non-negative")
-    planner_enabled = tactical_planner or planner_only
+    if planner_turn_ownership and planner_commitment_ownership:
+        raise ValueError(
+            "planner_turn_ownership and planner_commitment_ownership are mutually exclusive"
+        )
+    planner_enabled = (
+        tactical_planner
+        or planner_only
+        or plan_mcts
+        or planner_turn_ownership
+        or planner_commitment_ownership
+    )
     if planner_only and mcts_simulations:
         raise ValueError("planner_only cannot be combined with MCTS")
-    if planner_only:
+    if planner_turn_ownership and mcts_simulations:
+        raise ValueError("planner_turn_ownership cannot be combined with atomic MCTS")
+    if planner_commitment_ownership and mcts_simulations:
+        raise ValueError(
+            "planner_commitment_ownership cannot be combined with atomic MCTS"
+        )
+    if plan_mcts and (
+        planner_only or planner_turn_ownership or planner_commitment_ownership
+    ):
+        raise ValueError("plan_mcts owns executor selection and cannot use ownership flags")
+    if mega_expert:
+        mode = "mega-expert"
+    elif plan_mcts:
+        mode = "plan-mcts"
+    elif planner_only:
         mode = "planner"
     elif planner_enabled and mcts_simulations:
         mode = "planner-mcts"
@@ -121,6 +210,8 @@ def build_submission(
             "threshold": planner_threshold,
             "weight": planner_weight,
             "confidence_routing": planner_confidence_routing,
+            "turn_ownership": planner_turn_ownership,
+            "commitment_ownership": planner_commitment_ownership,
             "profile": "mega-lucario-ex",
         },
         "mcts": {
@@ -131,6 +222,15 @@ def build_submission(
             "max_actions": mcts_max_actions,
             "root_contexts": [0],
         },
+        "plan_mcts": {
+            "enabled": plan_mcts,
+            "determinizations": plan_determinizations,
+            "max_macro_steps": plan_max_steps,
+            "root_contexts": [0],
+            "prior": plan_mcts_prior,
+            "belief_hypotheses": belief_hypotheses,
+        },
+        "mega_expert": {"enabled": mega_expert},
     }
 
     runtime_source = Path(__file__).with_name("submission_runtime.py")
@@ -194,6 +294,31 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mcts-max-depth", type=int, default=12)
     parser.add_argument("--mcts-max-actions", type=int, default=16)
     parser.add_argument(
+        "--plan-mcts",
+        action="store_true",
+        help="Search between local-router and full-turn Planner macro executors.",
+    )
+    parser.add_argument("--plan-determinizations", type=int, default=4)
+    parser.add_argument("--plan-max-steps", type=int, default=32)
+    parser.add_argument(
+        "--mega-expert",
+        action="store_true",
+        help="Build the native public Mega Lucario expert as a standalone agent.",
+    )
+    parser.add_argument(
+        "--plan-mcts-prior",
+        choices=("fixed-model", "belief"),
+        default="fixed-model",
+        help="Opponent-deck prior used by Plan MCTS determinization.",
+    )
+    parser.add_argument(
+        "--belief-deck",
+        action="append",
+        default=[],
+        metavar="NAME=PATH",
+        help="Repeat to package a candidate opponent deck for the belief prior.",
+    )
+    parser.add_argument(
         "--tactical-planner",
         action="store_true",
         help="Blend the Mega Lucario tactical planner with policy/MCTS decisions.",
@@ -217,11 +342,30 @@ def build_parser() -> argparse.ArgumentParser:
         dest="planner_confidence_routing",
         action="store_false",
     )
+    parser.add_argument(
+        "--planner-turn-ownership",
+        action="store_true",
+        help="Keep the turn-start Planner/Policy owner for every decision in that turn.",
+    )
+    parser.add_argument(
+        "--planner-commitment-ownership",
+        action="store_true",
+        help=(
+            "Own ordinary resolver chains, but claim the full turn only for an "
+            "explicit TacticalPlan commitment."
+        ),
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    try:
+        belief_decks = [
+            _named_path(value, "--belief-deck") for value in args.belief_deck
+        ]
+    except (FileNotFoundError, ValueError) as error:
+        raise SystemExit(str(error)) from error
     result = build_submission(
         args.checkpoint,
         args.output,
@@ -232,11 +376,19 @@ def main(argv: list[str] | None = None) -> int:
         mcts_c_puct=args.mcts_c_puct,
         mcts_max_depth=args.mcts_max_depth,
         mcts_max_actions=args.mcts_max_actions,
+        plan_mcts=args.plan_mcts,
+        plan_determinizations=args.plan_determinizations,
+        plan_max_steps=args.plan_max_steps,
+        plan_mcts_prior=args.plan_mcts_prior,
+        opponent_belief_decks=belief_decks,
+        mega_expert=args.mega_expert,
         tactical_planner=args.tactical_planner,
         planner_only=args.planner_only,
         planner_threshold=args.planner_threshold,
         planner_weight=args.planner_weight,
         planner_confidence_routing=args.planner_confidence_routing,
+        planner_turn_ownership=args.planner_turn_ownership,
+        planner_commitment_ownership=args.planner_commitment_ownership,
     )
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0
