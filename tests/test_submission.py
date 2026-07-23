@@ -53,6 +53,41 @@ def test_build_submission_has_root_layout_and_slim_checkpoint(tmp_path: Path) ->
     assert agent_config["mode"] == "policy"
 
 
+def test_build_submission_packages_advantage_runtime(tmp_path: Path) -> None:
+    official = _fake_official_dir(tmp_path)
+    advantage = tmp_path / "advantage.pt"
+    round0 = tmp_path / "round0.pt"
+    baseline = tmp_path / "baseline.py"
+    torch.save(
+        {
+            "model_config": {},
+            "model_state_dict": {},
+            "advantage_config": {"baseline_relative": True},
+        },
+        advantage,
+    )
+    torch.save({"model_config": {}, "model_state_dict": {}}, round0)
+    baseline.write_text("def agent(observation):\n    return [0]\n", encoding="utf-8")
+
+    result = build_submission(
+        advantage,
+        tmp_path / "submission.tar.gz",
+        official_dir=official,
+        advantage_baseline_source=baseline,
+        advantage_round0_checkpoint=round0,
+        advantage_allowed_transitions=[(7, 14), (7, 13)],
+    )
+
+    assert result["agent_config"]["mode"] == "advantage"
+    assert result["agent_config"]["advantage"]["allowed_transitions"] == [
+        [7, 13],
+        [7, 14],
+    ]
+    with tarfile.open(result["archive"], "r:gz") as archive:
+        names = {member.name for member in archive.getmembers() if member.isfile()}
+        assert {"round0_model.pt", "libraryout_baseline.py"} <= names
+
+
 def test_build_submission_records_mcts_runtime_config(tmp_path: Path) -> None:
     official = _fake_official_dir(tmp_path)
     checkpoint = tmp_path / "model.pt"

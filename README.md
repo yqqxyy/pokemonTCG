@@ -554,6 +554,230 @@ python -m poketcg.rl.evaluate_residual \
 高分歧、低规则 margin 的局面追加 MCTS/counterfactual rollout 标签，形成真正能学习覆盖规则的
 Round 1 数据。
 
+#### 在线 paired one-step-deviation rollout
+
+旧 trajectory JSONL 只有编码后的可见状态，不能恢复官方引擎的隐藏状态、RNG 和未结算效果。
+`collect_paired_rollouts` 因此在 V1 正式对局进行中选择 MAIN 单选状态，立即调用官方 Search API
+建立根状态；同一个 determinization 下，V1 和两个候选从相同 root 分叉，之后由双方原规则 Agent
+继续到终局。正式对局始终执行 V1，不受搜索结果影响。
+
+候选集合合并 V1、Round 0 logits、Rule top-k 和不同 option type。若根动作打开 TO_HAND、
+ATTACH_TO、SWITCH 等强制选择，V1 会完成该短 option，并在记录中保存到返回 MAIN、换回合或终局
+为止的 `option_sequence`。完整分支则继续到终局；只有超过 `--max-rollout-steps` 才使用 Round 0
+Value bootstrap。
+
+先用 50 状态 × 8 determinizations 检查错误率、paired 标准误和标签符号分布：
+
+```bash
+python -m poketcg.rl.collect_paired_rollouts \
+  --expert-source artifacts/public_agents/libraryout_1208/main.py \
+  --expert-deck artifacts/public_agents/libraryout_1208/deck.csv \
+  --checkpoint artifacts/checkpoints/libraryout_residual_round0.pt \
+  --mirror \
+  --external-opponent strong_start=artifacts/public_agents/strong_start_v10/main.py,artifacts/public_agents/strong_start_v10/deck.csv \
+  --external-opponent baseline1084=artifacts/public_agents/baseline_1084/main.py,artifacts/public_agents/baseline_1084/deck.csv \
+  --external-opponent alakazam=artifacts/public_agents/alakazam_best5/main.py,artifacts/public_agents/alakazam_best5/deck.csv \
+  --external-opponent field_alakazam=artifacts/public_agents/field_audited_alakazam_v8/main.py,artifacts/public_agents/field_audited_alakazam_v8/deck.csv \
+  --external-opponent archaludon=artifacts/public_agents/archaludon_vs_starmie/main.py,artifacts/public_agents/archaludon_vs_starmie/deck.csv \
+  --external-opponent mega_lucario=artifacts/public_agents/mega_lucario/a-sample-rule-based-agent-mega-lucario-ex-deck.ipynb,artifacts/public_agents/mega_lucario/deck.csv \
+  --target-states 50 --max-games 350 --determinizations 8 \
+  --max-states-per-game 1 --random-state-probability 0.15 \
+  --workers 8 --torch-threads 1 \
+  --output data/processed/libraryout_paired_screen50_det8.jsonl
+```
+
+要求 `search_failures == 0`、`rollout_errors` 为空且绝大多数分支到达 `terminal`。通过后把
+`--target-states` 扩为 500、`--max-games` 扩为 1400、`--determinizations` 扩为 16。相邻
+`.summary.json` 会额外报告 advantage 分位数、paired stderr，以及有候选满足 95% LCB > 0.05
+的状态数。Round 1 advantage ensemble 只使用这份 paired 数据，不从旧 JSONL 重建状态。
+
+#### Round 1 baseline-relative advantage ensemble
+
+`train_advantage` 不再拟合 V1 动作，也不把神经 logits 直接叠加到规则分数。对每个已经 rollout
+的候选，它回归同一 determinization 内的相对收益：
+
+```text
+ΔQ(I, o) = Q^V1(I, o) - Q^V1(I, o_v1)
+```
+
+模型预测同样使用候选 logit 与 V1 baseline logit 的差，因此对所有 logits 的公共平移不敏感。
+loss 使用带噪声下限和上限的 inverse-variance 权重；第一轮默认冻结 V3 Transformer，只训练
+policy head。三个成员从相同 Round 0 表示出发，但分别 bootstrap 训练状态，供后续用 ensemble
+mean/std 做保守 LCB gate。
+
+```bash
+python -m poketcg.rl.train_advantage \
+  --input data/processed/libraryout_paired_round1_500_det16.jsonl \
+  --initialize-from artifacts/checkpoints/libraryout_residual_round0.pt \
+  --output-dir artifacts/checkpoints/libraryout_advantage_round1 \
+  --ensemble-size 3 --epochs 40 --patience 8 --batch-size 64 \
+  --train-scope policy_head --learning-rate 0.0003 \
+  --huber-delta 0.25 --noise-floor 0.15 --maximum-weight 20 \
+  --gate-threshold 0.05 --uncertainty-multiplier 1.0 \
+  --checkpoint-selection gain_lcb --selection-risk-multiplier 1.0 \
+  --device cpu --seed 20260723
+```
+
+输出目录包含三个 `advantage_member*.pt` 和 `ensemble_manifest.json`。是否进入在线 shadow
+不能只看 validation loss；还必须检查 `validation_lcb_metrics` 的 `selected_gain` 为正、
+`harmful_override_rate` 足够低，并让覆盖率保持在保守区间。若这三项不满足，优先扩大 paired
+状态数据，而不是把弱 reranker 接到 V1。
+
+Advantage checkpoint 默认按固定验证集上的风险调整收益
+`selected_gain_lcb = mean_gain - multiplier * standard_error` 选择，而不是按回归 loss 选择。
+后者容易偏好把所有优势压到零附近的模型，虽然 MAE 较低，却不一定产生更好的覆盖动作。
+
+扩大数据时必须更换 collector `--seed`。第一份 500-state 数据可固定为从不参与梯度更新的
+验证集，新采集数据则全部用于 bootstrap 训练：
+
+```bash
+python -m poketcg.rl.train_advantage \
+  --input data/processed/libraryout_paired_round1_train3000_det16.jsonl \
+  --validation-input data/processed/libraryout_paired_round1_500_det16.jsonl \
+  --initialize-from artifacts/checkpoints/libraryout_residual_round0.pt \
+  --output-dir artifacts/checkpoints/libraryout_advantage_round1_3000 \
+  --ensemble-size 3 --epochs 40 --patience 8 --batch-size 64 --device cpu
+```
+
+早期版本在每局遇到第一个分歧时就采样，导致绝大多数状态来自 Turn 1/2，终局标签方差过大。
+后续高精度数据必须用 `--minimum-turn 3` 单独筛选中后期状态，并先以较小 screen 检查 turn
+分布、paired stderr 和 estimated label reliability，再决定是否扩大。
+
+#### Turn-gated advantage reranker
+
+当前安全版本只在 Turn 4 以后评估与 paired collector 相同的候选集合，并通过动作语义白名单
+限制覆盖。第一版只允许 `PLAY(7) -> END(14)` 和 `PLAY(7) -> ATTACK(13)`；其他模型建议全部
+退回 Library-Out V1。下面的命令同时评测原 V1 和实际执行覆盖的 reranker：
+
+```bash
+python -m poketcg.rl.evaluate_advantage \
+  --advantage-checkpoint artifacts/checkpoints/libraryout_advantage_turn4_1500_gain_selected/advantage_member00.pt \
+  --round0-checkpoint artifacts/checkpoints/libraryout_residual_round0.pt \
+  --baseline-source artifacts/public_agents/libraryout_1208/main.py \
+  --baseline-deck artifacts/public_agents/libraryout_1208/deck.csv \
+  --external-opponent mirror=artifacts/public_agents/libraryout_1208/main.py,artifacts/public_agents/libraryout_1208/deck.csv \
+  --games-per-seat 200 --minimum-turn 4 --gate-threshold 0.05 \
+  --allowed-transition '7->14' --allowed-transition '7->13' \
+  --output results/evaluation/libraryout_advantage_turn4_semantic_confirm200x2.json
+```
+
+三对手 1200 局确认中，V1 为 56.33%，reranker 为 57.25%，实际覆盖率 6.26%；Wilson 区间
+仍重叠，因此这只通过了本地安全性检查，不构成确定优于 V1 的统计证据。
+
+构建对应的实验提交包时，必须同时打包 V1 源码、Library-Out 牌组和 Round 0 候选模型：
+
+```bash
+python -m poketcg.submission \
+  --checkpoint artifacts/checkpoints/libraryout_advantage_turn4_1500_gain_selected/advantage_member00.pt \
+  --deck artifacts/public_agents/libraryout_1208/deck.csv \
+  --advantage-baseline-source artifacts/public_agents/libraryout_1208/main.py \
+  --advantage-round0-checkpoint artifacts/checkpoints/libraryout_residual_round0.pt \
+  --advantage-minimum-turn 4 --advantage-gate-threshold 0.05 \
+  --advantage-allowed-transition '7->14' \
+  --advantage-allowed-transition '7->13' \
+  --output artifacts/submissions/libraryout_advantage_turn4_semantic/submission.tar.gz
+```
+
+该提交仍以 Library-Out V1 为默认动作；神经网络初始化、候选生成或推理失败时也会退回 V1，
+不会把 advantage checkpoint 当成普通 policy 直接执行。
+
+#### 完整回合协同收益诊断
+
+one-step paired rollout 在候选根动作后立即把控制权交回 V1，因此看不到“动作 A 单独无效，
+动作 B 单独无效，但 A→B 联合有效”的改进。`collect_turn_synergy` 在同一个在线 Search 根状态
+和同一个 belief determinization 内同时比较：
+
+1. V1 完整回合；
+2. 只改变根动作、后续交回 V1；
+3. 在当前玩家整个回合内持续展开的 beam search。
+
+第三项会跨过 TO_HAND、ATTACH_TO、SWITCH 等 option context，并在返回 MAIN 后继续分支。
+它为每个隐藏世界分别选取最佳完整计划，因此输出是验证组合策略上限的 oracle diagnostic，
+不能直接当作线上 policy 的监督标签。
+
+先跑 12 个状态 × 2 个 determinizations 的管线 screen：
+
+```bash
+python -m poketcg.rl.collect_turn_synergy \
+  --expert-source artifacts/public_agents/libraryout_1208/main.py \
+  --expert-deck artifacts/public_agents/libraryout_1208/deck.csv \
+  --checkpoint artifacts/checkpoints/libraryout_residual_round0.pt \
+  --mirror \
+  --external-opponent strong_start=artifacts/public_agents/strong_start_v10/main.py,artifacts/public_agents/strong_start_v10/deck.csv \
+  --external-opponent baseline1084=artifacts/public_agents/baseline_1084/main.py,artifacts/public_agents/baseline_1084/deck.csv \
+  --target-states 12 --max-games 120 --determinizations 2 \
+  --beam-width 8 --branch-width 4 --max-plan-steps 32 \
+  --max-states-per-game 1 --minimum-turn 3 \
+  --workers 4 --torch-threads 1 --seed 20260801 \
+  --output data/processed/libraryout_turn_synergy_screen12_det2.jsonl
+```
+
+相邻的 `.summary.json` 重点检查 `search_failures`、`search_errors`、`branch_errors`、
+`diagnostics.hidden_synergy_rate` 和 `diagnostics.joint_rescue_rate`。前三项原则上都应为零；
+若仅 `branch_errors` 非零，collector 会跳过单个非法候选并保留其余
+有效 beam 分支，但扩大实验前仍应先检查错误消息。后两项用于判断完整回合搜索是否发现了
+one-step 标签系统性遗漏的组合收益。screen 通过后，用 7 个对手各约 20 个状态做确认：
+
+```bash
+python -m poketcg.rl.collect_turn_synergy \
+  --expert-source artifacts/public_agents/libraryout_1208/main.py \
+  --expert-deck artifacts/public_agents/libraryout_1208/deck.csv \
+  --checkpoint artifacts/checkpoints/libraryout_residual_round0.pt \
+  --mirror \
+  --external-opponent strong_start=artifacts/public_agents/strong_start_v10/main.py,artifacts/public_agents/strong_start_v10/deck.csv \
+  --external-opponent baseline1084=artifacts/public_agents/baseline_1084/main.py,artifacts/public_agents/baseline_1084/deck.csv \
+  --external-opponent alakazam=artifacts/public_agents/alakazam_best5/main.py,artifacts/public_agents/alakazam_best5/deck.csv \
+  --external-opponent field_alakazam=artifacts/public_agents/field_audited_alakazam_v8/main.py,artifacts/public_agents/field_audited_alakazam_v8/deck.csv \
+  --external-opponent archaludon=artifacts/public_agents/archaludon_vs_starmie/main.py,artifacts/public_agents/archaludon_vs_starmie/deck.csv \
+  --external-opponent mega_lucario=artifacts/public_agents/mega_lucario/a-sample-rule-based-agent-mega-lucario-ex-deck.ipynb,artifacts/public_agents/mega_lucario/deck.csv \
+  --target-states 140 --max-games 980 --determinizations 8 \
+  --beam-width 8 --branch-width 4 --max-plan-steps 32 \
+  --max-states-per-game 1 --minimum-turn 3 \
+  --workers 8 --torch-threads 1 --seed 20260805 \
+  --output data/processed/libraryout_turn_synergy_confirm140_det8.jsonl
+```
+
+判读时以 `diagnostics.state_synergy_rate` 及其 Wilson 95% 区间为主，world-level rate 只作机制
+诊断。若区间下界超过 10%，组合动作盲区有较强证据；若上界低于 10%，它不是当前主要瓶颈；
+区间跨过 10% 时需要独立 seed 或 beam-width 消融。不能把这一批 oracle 分支直接送入训练器。
+
+#### Held-out 语义 Turn Plan 评测
+
+oracle 搜索证明“某个隐藏世界中存在更好的完整回合”，但线上 Agent 看不到对手手牌和牌库顺序，
+也不能为每个隐藏世界选择不同动作。加入 `--heldout-semantic` 后，评测器会：
+
+1. 仅在 proposal determinizations 上搜索候选回合计划；
+2. 把候选动作转换为卡牌 ID、攻击 ID、区域、目标卡等语义指令，不保存易变的 option 下标；
+3. 只根据 proposal 配对收益下界选择一条固定计划；
+4. 将同一条计划重放到从未参与搜索和选择的 held-out determinizations；
+5. 无法解析语义动作时立即退回 V1，并记录 replay/fallback 指标。
+
+先运行小规模 screen：
+
+```bash
+python -m poketcg.rl.collect_turn_synergy \
+  --heldout-semantic \
+  --expert-source artifacts/public_agents/libraryout_1208/main.py \
+  --expert-deck artifacts/public_agents/libraryout_1208/deck.csv \
+  --checkpoint artifacts/checkpoints/libraryout_residual_round0.pt \
+  --mirror \
+  --external-opponent strong_start=artifacts/public_agents/strong_start_v10/main.py,artifacts/public_agents/strong_start_v10/deck.csv \
+  --external-opponent baseline1084=artifacts/public_agents/baseline_1084/main.py,artifacts/public_agents/baseline_1084/deck.csv \
+  --target-states 12 --max-games 120 \
+  --proposal-determinizations 4 --heldout-determinizations 4 \
+  --plan-pool-size 16 --selection-risk-multiplier 1.0 \
+  --beam-width 8 --branch-width 4 --max-plan-steps 32 \
+  --max-states-per-game 1 --minimum-turn 3 \
+  --workers 4 --torch-threads 1 --seed 20260806 \
+  --output data/processed/libraryout_heldout_turn_plan_screen12_p4h4.jsonl
+```
+
+重点看 `.summary.json` 中的 `mean_heldout_gain`、`mean_heldout_gain_ci95`、
+`mean_optimism_gap`、`mean_replay_success_rate` 和 `accepted_heldout_rate`。proposal gain 高但
+held-out gain 接近零，说明搜索在拟合少量 sampled worlds；replay success 低则说明当前计划
+表示仍依赖不稳定的物理下标。只有 held-out 收益稳定为正、重放率接近 1 的计划，才适合进入
+下一阶段的监督数据构建；`heldout_accepted` 是诊断标签，不会在同一批数据上重新选择计划。
+
 ### Mega Lucario 显式战术规划器
 
 `TacticalPlannerAgent` 先枚举本回合可形成的攻击计划，再让后续附能、进化、换位、Boss、伤害

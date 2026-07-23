@@ -28,6 +28,8 @@ _HYBRID: Any | None = None
 _MCTS: Any | None = None
 _PLAN_MCTS: Any | None = None
 _MEGA_EXPERT: Any | None = None
+_ADVANTAGE: Any | None = None
+_LIBRARYOUT_BASELINE: Any | None = None
 _RULE_AGENT: Any | None = None
 _POLICY_DISABLED = False
 _MCTS_DISABLED = False
@@ -103,6 +105,62 @@ def _get_rule_agent() -> Any | None:
     except Exception:
         traceback.print_exc()
     return _RULE_AGENT
+
+
+def _get_libraryout_baseline() -> Any | None:
+    global _LIBRARYOUT_BASELINE
+    if _CONFIG.get("mode") != "advantage":
+        return None
+    if _LIBRARYOUT_BASELINE is not None:
+        return _LIBRARYOUT_BASELINE
+    try:
+        from poketcg.agents import ExternalPythonAgent
+
+        _LIBRARYOUT_BASELINE = ExternalPythonAgent(
+            _ROOT / "libraryout_baseline.py",
+            _ROOT / "deck.csv",
+            name="libraryout-baseline-fallback",
+            expected_deck=_read_deck(),
+        )
+    except Exception:
+        traceback.print_exc()
+    return _LIBRARYOUT_BASELINE
+
+
+def _get_advantage() -> Any | None:
+    global _ADVANTAGE
+    if _CONFIG.get("mode") != "advantage":
+        return None
+    if _ADVANTAGE is not None:
+        return _ADVANTAGE
+    try:
+        from poketcg.agents import AdvantageRerankerAgent
+
+        cards, attacks = _catalogs()
+        settings = _CONFIG.get("advantage") or {}
+        transitions = {
+            (int(item[0]), int(item[1]))
+            for item in settings.get("allowed_transitions") or []
+        }
+        _ADVANTAGE = AdvantageRerankerAgent(
+            [_ROOT / "model.pt"],
+            _ROOT / "round0_model.pt",
+            _ROOT / "libraryout_baseline.py",
+            _ROOT / "deck.csv",
+            card_catalog=cards,
+            attack_catalog=attacks,
+            expected_deck=_read_deck(),
+            device="cpu",
+            minimum_turn=int(settings.get("minimum_turn", 4)),
+            gate_threshold=float(settings.get("gate_threshold", 0.05)),
+            uncertainty_multiplier=float(
+                settings.get("uncertainty_multiplier", 0.0)
+            ),
+            allowed_transitions=transitions,
+        )
+    except Exception:
+        traceback.print_exc()
+    return _ADVANTAGE
 
 
 def _get_mega_expert() -> Any | None:
@@ -337,6 +395,10 @@ def _minimum_legal_action(observation: dict) -> list[int]:
 def agent(obs_dict: dict) -> list[int]:
     """Return the deck initially, then select legal option indices during battle."""
     if obs_dict.get("select") is None:
+        if _ADVANTAGE is not None:
+            _ADVANTAGE.reset_episode()
+        if _LIBRARYOUT_BASELINE is not None:
+            _LIBRARYOUT_BASELINE.reset_episode()
         if _MEGA_EXPERT is not None:
             _MEGA_EXPERT.reset_episode()
         if _PLAN_MCTS is not None:
@@ -355,6 +417,27 @@ def agent(obs_dict: dict) -> list[int]:
             return mega_expert.choose_action(obs_dict)
         except Exception:
             traceback.print_exc()
+
+    if _CONFIG.get("mode") == "advantage":
+        advantage = _get_advantage()
+        if advantage is not None:
+            try:
+                return advantage.choose_action(obs_dict)
+            except Exception:
+                traceback.print_exc()
+        baseline = _get_libraryout_baseline()
+        if baseline is not None:
+            try:
+                return baseline.choose_action(obs_dict)
+            except Exception:
+                traceback.print_exc()
+        rule_agent = _get_rule_agent()
+        if rule_agent is not None:
+            try:
+                return rule_agent.choose_action(obs_dict)
+            except Exception:
+                traceback.print_exc()
+        return _minimum_legal_action(obs_dict)
 
     plan_mcts = _get_plan_mcts()
     if plan_mcts is not None:

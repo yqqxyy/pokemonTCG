@@ -1,5 +1,6 @@
 """Agent implementations."""
 
+from .advantage_agent import AdvantageRerankerAgent
 from .base import Agent
 from .bc_agent import BCPolicyAgent, HybridPolicyAgent
 from .external_agent import ExternalPythonAgent
@@ -20,6 +21,7 @@ from .tactical_planner import (
 
 __all__ = [
     "Agent",
+    "AdvantageRerankerAgent",
     "BCPolicyAgent",
     "ExternalPythonAgent",
     "HybridPolicyAgent",

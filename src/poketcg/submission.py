@@ -44,6 +44,8 @@ def _load_inference_checkpoint(checkpoint: Path) -> tuple[dict[str, Any], dict[s
         "model_config": saved["model_config"],
         "model_state_dict": saved["model_state_dict"],
     }
+    if "advantage_config" in saved:
+        inference_checkpoint["advantage_config"] = saved["advantage_config"]
     return inference_checkpoint, saved["model_config"]
 
 
@@ -118,6 +120,11 @@ def build_submission(
     planner_confidence_routing: bool = True,
     planner_turn_ownership: bool = False,
     planner_commitment_ownership: bool = False,
+    advantage_baseline_source: str | Path | None = None,
+    advantage_round0_checkpoint: str | Path | None = None,
+    advantage_minimum_turn: int = 4,
+    advantage_gate_threshold: float = 0.05,
+    advantage_allowed_transitions: Sequence[tuple[int, int]] | None = None,
 ) -> dict[str, Any]:
     """Create and validate a root-layout ``submission.tar.gz`` archive."""
     checkpoint_path = Path(checkpoint).expanduser().resolve()
@@ -130,6 +137,44 @@ def build_submission(
     deck_path = Path(deck).expanduser().resolve() if deck else official_path / "deck.csv"
     deck_values = OfficialEngine.load_deck(deck_path)
     inference_checkpoint, model_config = _load_inference_checkpoint(checkpoint_path)
+    advantage_enabled = (
+        advantage_baseline_source is not None
+        or advantage_round0_checkpoint is not None
+        or bool(advantage_allowed_transitions)
+    )
+    if advantage_enabled and (
+        advantage_baseline_source is None or advantage_round0_checkpoint is None
+    ):
+        raise ValueError(
+            "Advantage mode requires baseline source and Round 0 checkpoint"
+        )
+    advantage_source_path = (
+        Path(advantage_baseline_source).expanduser().resolve()
+        if advantage_baseline_source is not None
+        else None
+    )
+    advantage_round0_path = (
+        Path(advantage_round0_checkpoint).expanduser().resolve()
+        if advantage_round0_checkpoint is not None
+        else None
+    )
+    if advantage_source_path is not None and not advantage_source_path.is_file():
+        raise FileNotFoundError(
+            f"Advantage baseline source not found: {advantage_source_path}"
+        )
+    if advantage_round0_path is not None and not advantage_round0_path.is_file():
+        raise FileNotFoundError(
+            f"Advantage Round 0 checkpoint not found: {advantage_round0_path}"
+        )
+    if advantage_enabled and "advantage_config" not in inference_checkpoint:
+        raise ValueError("Advantage mode requires an advantage checkpoint")
+    if advantage_minimum_turn <= 0:
+        raise ValueError("advantage_minimum_turn must be positive")
+    if advantage_gate_threshold < 0:
+        raise ValueError("advantage_gate_threshold must be non-negative")
+    transitions = sorted(set(advantage_allowed_transitions or ()))
+    if any(source < 0 or target < 0 for source, target in transitions):
+        raise ValueError("Advantage option-type transitions must be non-negative")
     if mcts_simulations < 0:
         raise ValueError("mcts_simulations must be non-negative")
     if mcts_determinizations <= 0:
@@ -177,6 +222,13 @@ def build_submission(
         or planner_turn_ownership
         or planner_commitment_ownership
     )
+    if advantage_enabled and (
+        mcts_simulations
+        or plan_mcts
+        or mega_expert
+        or planner_enabled
+    ):
+        raise ValueError("Advantage mode cannot be combined with other agent modes")
     if planner_only and mcts_simulations:
         raise ValueError("planner_only cannot be combined with MCTS")
     if planner_turn_ownership and mcts_simulations:
@@ -189,7 +241,9 @@ def build_submission(
         planner_only or planner_turn_ownership or planner_commitment_ownership
     ):
         raise ValueError("plan_mcts owns executor selection and cannot use ownership flags")
-    if mega_expert:
+    if advantage_enabled:
+        mode = "advantage"
+    elif mega_expert:
         mode = "mega-expert"
     elif plan_mcts:
         mode = "plan-mcts"
@@ -231,6 +285,13 @@ def build_submission(
             "belief_hypotheses": belief_hypotheses,
         },
         "mega_expert": {"enabled": mega_expert},
+        "advantage": {
+            "enabled": advantage_enabled,
+            "minimum_turn": advantage_minimum_turn,
+            "gate_threshold": advantage_gate_threshold,
+            "uncertainty_multiplier": 0.0,
+            "allowed_transitions": [list(item) for item in transitions],
+        },
     }
 
     runtime_source = Path(__file__).with_name("submission_runtime.py")
@@ -249,6 +310,12 @@ def build_submission(
             encoding="utf-8",
         )
         torch.save(inference_checkpoint, root / "model.pt")
+        if advantage_enabled:
+            assert advantage_source_path is not None
+            assert advantage_round0_path is not None
+            round0_checkpoint, _ = _load_inference_checkpoint(advantage_round0_path)
+            torch.save(round0_checkpoint, root / "round0_model.pt")
+            shutil.copy2(advantage_source_path, root / "libraryout_baseline.py")
         _copy_runtime_tree(package_source, root / "poketcg")
         _copy_runtime_tree(official_path / "cg", root / "cg")
 
@@ -261,6 +328,8 @@ def build_submission(
 
     members = _archive_members(temporary_archive)
     missing = REQUIRED_ARCHIVE_FILES - members
+    if advantage_enabled:
+        missing |= {"round0_model.pt", "libraryout_baseline.py"} - members
     if missing:
         temporary_archive.unlink(missing_ok=True)
         raise RuntimeError(f"Submission archive is missing files: {sorted(missing)}")
@@ -283,6 +352,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--official-dir", type=Path)
     parser.add_argument("--deck", type=Path)
+    parser.add_argument("--advantage-baseline-source", type=Path)
+    parser.add_argument("--advantage-round0-checkpoint", type=Path)
+    parser.add_argument("--advantage-minimum-turn", type=int, default=4)
+    parser.add_argument("--advantage-gate-threshold", type=float, default=0.05)
+    parser.add_argument(
+        "--advantage-allowed-transition",
+        action="append",
+        default=[],
+        metavar="FROM->TO",
+    )
     parser.add_argument(
         "--mcts-simulations",
         type=int,
@@ -366,6 +445,17 @@ def main(argv: list[str] | None = None) -> int:
         ]
     except (FileNotFoundError, ValueError) as error:
         raise SystemExit(str(error)) from error
+    try:
+        advantage_transitions = []
+        for value in args.advantage_allowed_transition:
+            source, separator, target = value.partition("->")
+            if not separator:
+                raise ValueError(
+                    "--advantage-allowed-transition expects FROM->TO"
+                )
+            advantage_transitions.append((int(source), int(target)))
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
     result = build_submission(
         args.checkpoint,
         args.output,
@@ -389,6 +479,11 @@ def main(argv: list[str] | None = None) -> int:
         planner_confidence_routing=args.planner_confidence_routing,
         planner_turn_ownership=args.planner_turn_ownership,
         planner_commitment_ownership=args.planner_commitment_ownership,
+        advantage_baseline_source=args.advantage_baseline_source,
+        advantage_round0_checkpoint=args.advantage_round0_checkpoint,
+        advantage_minimum_turn=args.advantage_minimum_turn,
+        advantage_gate_threshold=args.advantage_gate_threshold,
+        advantage_allowed_transitions=advantage_transitions,
     )
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0
