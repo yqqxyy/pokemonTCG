@@ -107,6 +107,7 @@ class TokenPolicyValueNet(nn.Module):
         attack_vocab_size: int = 2048,
         semantic_feature_size: int = 0,
         history_feature_size: int = 0,
+        condition_feature_size: int = 0,
     ) -> None:
         super().__init__()
         if hidden_size % num_heads != 0:
@@ -117,6 +118,7 @@ class TokenPolicyValueNet(nn.Module):
         self.attack_vocab_size = attack_vocab_size
         self.semantic_feature_size = semantic_feature_size
         self.history_feature_size = history_feature_size
+        self.condition_feature_size = condition_feature_size
         if semantic_feature_size not in {0, SEMANTIC_FEATURE_SIZE}:
             raise ValueError("semantic_feature_size does not match the V3 schema")
         if history_feature_size not in {0, HISTORY_FEATURE_SIZE}:
@@ -155,6 +157,11 @@ class TokenPolicyValueNet(nn.Module):
             self.history_type_embedding = None
 
         self.state_projection = nn.Linear(STATE_FEATURE_SIZE, hidden_size)
+        self.condition_projection = (
+            nn.Linear(condition_feature_size, hidden_size)
+            if condition_feature_size
+            else None
+        )
         self.token_projection = nn.Linear(TOKEN_FEATURE_SIZE, hidden_size)
         self.option_projection = nn.Linear(OPTION_FEATURE_SIZE, hidden_size)
         self.state_norm = nn.LayerNorm(hidden_size)
@@ -226,11 +233,31 @@ class TokenPolicyValueNet(nn.Module):
                 batch["token_semantics"]
             )
         token_hidden = self.token_norm(token_hidden)
-        sequence_parts = [state_token.unsqueeze(1), token_hidden]
+        sequence_parts = [state_token.unsqueeze(1)]
         mask_parts = [
-            torch.ones(state_token.shape[0], 1, dtype=torch.bool, device=state_token.device),
-            batch["token_mask"],
+            torch.ones(state_token.shape[0], 1, dtype=torch.bool, device=state_token.device)
         ]
+        if self.condition_projection is not None:
+            if "condition" not in batch:
+                raise ValueError("condition is required by this model checkpoint")
+            if batch["condition"].shape[-1] != self.condition_feature_size:
+                raise ValueError(
+                    "condition feature size does not match the model configuration"
+                )
+            condition_token = self.token_norm(
+                self.condition_projection(batch["condition"])
+            )
+            sequence_parts.append(condition_token.unsqueeze(1))
+            mask_parts.append(
+                torch.ones(
+                    state_token.shape[0],
+                    1,
+                    dtype=torch.bool,
+                    device=state_token.device,
+                )
+            )
+        sequence_parts.append(token_hidden)
+        mask_parts.append(batch["token_mask"])
         if self.history_projection is not None and self.history_type_embedding is not None:
             history_card_ids = self._embedding_ids(
                 batch["history_card_ids"], self.card_vocab_size

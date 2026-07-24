@@ -265,10 +265,14 @@ class FeatureEncoder:
         return features
 
     def _option_card_id(self, observation: dict, option: dict) -> int | None:
+        area = int(option.get("area") or 0)
+        # Prize identities remain hidden even when the search backend has
+        # determinized them internally. Only the number of prizes is public.
+        if area == 6:
+            return None
         if option.get("cardId") is not None:
             return int(option["cardId"])
         index = option.get("index")
-        area = int(option.get("area") or 0)
         player_index = option.get("playerIndex")
         if index is None:
             return None
@@ -285,7 +289,6 @@ class FeatureEncoder:
             3: player.get("discard"),
             4: player.get("active"),
             5: player.get("bench"),
-            6: player.get("prize"),
         }.get(area)
         return self._record_id(records, index)
 
@@ -424,8 +427,6 @@ class FeatureEncoderV2(FeatureEncoder):
             (your_index, 1 - your_index), start=1
         ):
             player = state["players"][player_index]
-            for card in player.get("prize") or []:
-                add_card(card, kind=1, zone=6, owner=owner)
             # The newest discard cards are usually the most decision-relevant.
             for card in (player.get("discard") or [])[-48:]:
                 add_card(card, kind=1, zone=3, owner=owner)
