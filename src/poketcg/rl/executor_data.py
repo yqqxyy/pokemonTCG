@@ -85,6 +85,18 @@ EXECUTOR_CONDITION_SIZE = (
     + _CARD_BUCKETS  # cards already played while executing the plan
     + _ATTACK_BUCKETS  # attacks already used
 )
+EXECUTOR_PLAN_CONDITION_SLICE = slice(
+    0,
+    len(EXECUTOR_PLAN_TYPES)
+    + len(SEMANTIC_TAGS)
+    + _CARD_BUCKETS * 4
+    + _ATTACK_BUCKETS * 2
+    + _PLAN_SCALARS,
+)
+EXECUTOR_PROGRESS_CONDITION_SLICE = slice(
+    EXECUTOR_PLAN_CONDITION_SLICE.stop,
+    EXECUTOR_CONDITION_SIZE,
+)
 
 
 def _one_hot(value: Any, vocabulary: tuple[Any, ...]) -> list[float]:

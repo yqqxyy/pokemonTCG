@@ -1051,6 +1051,24 @@ manifest、初始化权重覆盖情况以及 validation/test 分层报告。retu
 macro synergy 不进入 Executor loss；它们属于后续冻结 Executor 后重新训练 Plan Selector 的
 阶段。
 
+训练完成后必须做 condition counterfactual，确认模型不是只看 decision/context。诊断严格读取
+checkpoint 中保存的 test split manifest：
+
+```bash
+python -m poketcg.rl.executor_diagnostics \
+  --checkpoint /content/drive/MyDrive/pokemonTCG/checkpoints/libraryout_executor_v1.pt \
+  --input /content/drive/MyDrive/pokemonTCG/macro/libraryout_macro_v2_executor_best_200.jsonl \
+  --split test --batch-size 256 --device cuda \
+  --seed 20260825 \
+  --output /content/drive/MyDrive/pokemonTCG/checkpoints/libraryout_executor_v1_condition_test.json
+```
+
+`zero_condition` 清空全部条件；`shuffled_plan` 在相同 phase/context 内换成另一种计划；
+`shuffled_progress` 只在相同 phase/context/plan type 内打乱执行进度。一个真正按计划工作的
+Executor 应在 `shuffled_plan` 下出现明显正 NLL delta、负 accuracy delta 和非零
+`action_change_rate`。如果 Plan 消融明显而 Progress 消融接近零，表示它学到了计划类型，但
+还没有充分利用闭环执行状态。
+
 ### Mega Lucario 显式战术规划器
 
 `TacticalPlannerAgent` 先枚举本回合可形成的攻击计划，再让后续附能、进化、换位、Boss、伤害

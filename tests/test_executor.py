@@ -9,6 +9,8 @@ import torch
 from poketcg.rl.action_space import subset_log_probability
 from poketcg.rl.executor_data import (
     EXECUTOR_CONDITION_SIZE,
+    EXECUTOR_PLAN_CONDITION_SLICE,
+    EXECUTOR_PROGRESS_CONDITION_SLICE,
     ExecutorDataset,
     ExecutorExample,
     encode_executor_condition,
@@ -16,6 +18,7 @@ from poketcg.rl.executor_data import (
     sanitize_public_decision,
     split_executor_dataset,
 )
+from poketcg.rl.executor_diagnostics import condition_variants
 from poketcg.rl.features import (
     HISTORY_FEATURE_SIZE,
     OPTION_FEATURE_SIZE,
@@ -298,3 +301,57 @@ def test_executor_split_never_crosses_game_groups() -> None:
     assert not train_groups.intersection(test_groups)
     assert not validation_groups.intersection(test_groups)
     assert set(manifest) == {"train", "validation", "test"}
+
+
+def test_condition_ablation_changes_only_requested_segment() -> None:
+    examples = []
+    plan_types = ("mill_four_now", "build_crustle_wall")
+    for index in range(6):
+        plan_type = plan_types[index % 2]
+        plan = _plan(plan_type)
+        progress = _progress(decisions=index)
+        examples.append(
+            ExecutorExample(
+                decision=_decision(),
+                condition=encode_executor_condition(plan, progress),
+                modal_action=[0],
+                inclusion_target=[1.0, 0.0, 0.0],
+                action_distribution=[([0], 1.0)],
+                consensus_rate=1.0,
+                normalized_entropy=0.0,
+                example_weight=1.0,
+                observation_count=2,
+                world_count=2,
+                split_group=f"group-{index}",
+                state_id=f"state-{index}",
+                input_fingerprint=f"fingerprint-{index}",
+                plan_type=plan_type,
+                phase="early",
+                context=3,
+                opponent="mirror",
+            )
+        )
+    variants = condition_variants(ExecutorDataset(examples), seed=11)
+    shuffled_plan, plan_summary = variants["shuffled_plan"]
+    shuffled_progress, progress_summary = variants["shuffled_progress"]
+
+    assert plan_summary["changed_fraction"] == 1.0
+    assert progress_summary["changed_fraction"] == 1.0
+    for original, changed in zip(examples, shuffled_plan.examples, strict=True):
+        assert (
+            original.condition[EXECUTOR_PLAN_CONDITION_SLICE]
+            != changed.condition[EXECUTOR_PLAN_CONDITION_SLICE]
+        )
+        assert (
+            original.condition[EXECUTOR_PROGRESS_CONDITION_SLICE]
+            == changed.condition[EXECUTOR_PROGRESS_CONDITION_SLICE]
+        )
+    for original, changed in zip(examples, shuffled_progress.examples, strict=True):
+        assert (
+            original.condition[EXECUTOR_PLAN_CONDITION_SLICE]
+            == changed.condition[EXECUTOR_PLAN_CONDITION_SLICE]
+        )
+        assert (
+            original.condition[EXECUTOR_PROGRESS_CONDITION_SLICE]
+            != changed.condition[EXECUTOR_PROGRESS_CONDITION_SLICE]
+        )
