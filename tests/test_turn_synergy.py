@@ -6,8 +6,11 @@ from pathlib import Path
 
 from poketcg.mcts import HiddenStateGuess, SearchPosition
 from poketcg.rl.collect_turn_synergy import (
+    split_phase_quotas,
+    summarize_heldout_options,
     summarize_heldout_turn_plans,
     summarize_turn_synergy,
+    turn_phase,
 )
 from poketcg.rl.heldout_turn_plan import HeldoutTurnPlanEvaluator
 from poketcg.rl.paired_rollout import RootCandidate
@@ -71,6 +74,25 @@ def _candidates(observation: dict) -> list[RootCandidate]:
         RootCandidate((0,), ("baseline",)),
         RootCandidate((1,), ("search",)),
     ]
+
+
+def test_turn_phase_boundaries_and_worker_quota_split() -> None:
+    assert [turn_phase(turn) for turn in (3, 4, 5, 7, 8, 12)] == [
+        "early",
+        "early",
+        "mid",
+        "mid",
+        "late",
+        "late",
+    ]
+
+    shards = split_phase_quotas((7, 8, 5), 4)
+
+    assert [
+        sum(shard[phase] for shard in shards)
+        for phase in ("early", "mid", "late")
+    ] == [7, 8, 5]
+    assert all(sum(shard.values()) == 5 for shard in shards)
 
 
 def test_turn_search_finds_joint_change_missed_by_one_step() -> None:
@@ -245,3 +267,66 @@ def test_heldout_summary_reports_optimism_and_replay(tmp_path: Path) -> None:
     assert summary["mean_replay_success_rate"] == 0.75
     assert summary["mean_resolved_fraction"] == 0.875
     assert summary["mean_candidate_plans"] == 6.0
+
+
+def test_closed_loop_option_summary_reports_gate_and_coverage(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "options.jsonl"
+    rows = [
+        {
+            "opponent": "mirror",
+            "turn": 3,
+            "diagnostic": {
+                "calibration_gate_passed": True,
+                "heldout_accepted": True,
+                "deployable_heldout_gain": 0.5,
+                "compiled_policies": 4,
+                "calibration_selected": {"paired_advantage": 1.0},
+                "heldout_selected": {
+                    "paired_advantage": 0.5,
+                    "mean_closed_loop_coverage": 1.0,
+                    "fallback_steps": 0,
+                    "continuation_steps": 2,
+                    "continuation_worlds": 2,
+                },
+            },
+        },
+        {
+            "opponent": "mirror",
+            "turn": 4,
+            "diagnostic": {
+                "calibration_gate_passed": False,
+                "heldout_accepted": False,
+                "deployable_heldout_gain": 0.0,
+                "compiled_policies": 2,
+                "calibration_selected": {"paired_advantage": 0.0},
+                "heldout_selected": {
+                    "paired_advantage": -0.5,
+                    "mean_closed_loop_coverage": 0.5,
+                    "fallback_steps": 2,
+                    "continuation_steps": 4,
+                    "continuation_worlds": 2,
+                },
+            },
+        },
+    ]
+    output.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+
+    summary = summarize_heldout_options(output)
+
+    assert summary["states"] == 2
+    assert summary["calibration_gate_rate"] == 0.5
+    assert summary["accepted_heldout_rate"] == 0.5
+    assert summary["mean_calibration_gain"] == 0.5
+    assert summary["mean_raw_heldout_gain"] == 0.0
+    assert summary["mean_deployable_heldout_gain"] == 0.25
+    assert summary["mean_gated_heldout_gain"] == 0.5
+    assert summary["mean_calibration_optimism_gap"] == 0.5
+    assert summary["mean_closed_loop_coverage"] == 0.75
+    assert summary["heldout_fallback_steps"] == 2
+    assert summary["continuation_steps"] == 6
+    assert summary["closed_loop_step_coverage"] == 0.666667
+    assert summary["mean_compiled_policies"] == 3.0

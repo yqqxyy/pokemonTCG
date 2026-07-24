@@ -29,7 +29,10 @@ from .collect_libraryout_trajectories import (
 )
 from .collect_paired_rollouts import selection_reason
 from .features import build_feature_encoder
+from .heldout_option import HeldoutCardEffectEvaluator
 from .heldout_turn_plan import HeldoutTurnPlanEvaluator
+from .macro_oracle import MacroPlanOracleEvaluator
+from .macro_plan import MacroPlanGenerator
 from .residual_data import normalize_rule_scores
 from .turn_synergy import TurnSynergyEvaluator, turn_candidates
 
@@ -53,10 +56,112 @@ class SynergyCollectorConfig:
     seed: int
     torch_threads: int
     heldout_semantic: bool = False
+    heldout_option: bool = False
+    macro_oracle: bool = False
+    build_determinizations: int = 8
+    calibration_determinizations: int = 8
     proposal_determinizations: int = 4
     heldout_determinizations: int = 4
     plan_pool_size: int = 16
     selection_risk_multiplier: float = 1.0
+    max_option_steps: int = 12
+    option_gate_multiplier: float = 1.96
+    option_min_calibration_pairs: int = 8
+    option_min_coverage: float = 0.9
+    option_familywise_alpha: float = 0.05
+    macro_alignment_weight: float = 0.05
+    compact_macro_oracle: bool = False
+    phase_quotas: tuple[int, int, int] | None = None
+    early_max_turn: int = 4
+    mid_max_turn: int = 7
+
+
+TURN_PHASES = ("early", "mid", "late")
+
+
+def turn_phase(
+    turn: int,
+    *,
+    early_max_turn: int = 4,
+    mid_max_turn: int = 7,
+) -> str:
+    """Map one public turn to the configured collection phase."""
+    if early_max_turn >= mid_max_turn:
+        raise ValueError("early_max_turn must be smaller than mid_max_turn")
+    if turn <= early_max_turn:
+        return "early"
+    if turn <= mid_max_turn:
+        return "mid"
+    return "late"
+
+
+def split_phase_quotas(
+    quotas: tuple[int, int, int],
+    workers: int,
+) -> list[dict[str, int]]:
+    """Distribute every phase quota exactly across worker shards."""
+    if workers <= 0:
+        raise ValueError("workers must be positive")
+    if any(value < 0 for value in quotas):
+        raise ValueError("phase quotas must be non-negative")
+    result = [dict.fromkeys(TURN_PHASES, 0) for _ in range(workers)]
+    cursor = 0
+    for phase, total in zip(TURN_PHASES, quotas, strict=True):
+        base, remainder = divmod(total, workers)
+        for worker in range(workers):
+            result[worker][phase] = base
+        for offset in range(remainder):
+            worker = (cursor + offset) % workers
+            result[worker][phase] += 1
+        cursor = (cursor + remainder) % workers
+    return result
+
+
+def compact_macro_diagnostic(
+    diagnostic: dict[str, Any],
+) -> dict[str, Any]:
+    """Drop non-teacher beam leaves after search without changing winners."""
+    if diagnostic.get("diagnostic_kind") != "macro_plan_oracle_v2_libraryout":
+        raise ValueError("compact mode requires macro_plan_oracle_v2_libraryout")
+    beam_trajectories = 0
+    beam_executor_rows = 0
+    retained_trajectories = 0
+    retained_executor_rows = 0
+    for sample in diagnostic["samples"]:
+        if "error" in sample:
+            continue
+        for plan_result in sample["plans"]:
+            trajectories = plan_result.pop("trajectories")
+            best = plan_result["best_trajectory"]
+            best_index = next(
+                (
+                    index
+                    for index, trajectory in enumerate(trajectories)
+                    if trajectory == best
+                ),
+                None,
+            )
+            if best_index is None:
+                raise ValueError(
+                    "best_trajectory is absent from its source beam"
+                )
+            plan_result["best_trajectory_index"] = best_index
+            beam_trajectories += len(trajectories)
+            beam_executor_rows += sum(
+                int(trajectory["decision_count"])
+                for trajectory in trajectories
+            )
+            retained_trajectories += 1
+            retained_executor_rows += int(best["decision_count"])
+    diagnostic["serialization"] = {
+        "mode": "best_per_plan_compact",
+        "search_quality_preserved": True,
+        "beam_trajectories": beam_trajectories,
+        "beam_executor_rows": beam_executor_rows,
+        "retained_teacher_trajectories": retained_trajectories,
+        "retained_executor_rows": retained_executor_rows,
+    }
+    return diagnostic
 
 
 def _new_external(
@@ -73,6 +178,7 @@ def _collect_shard(
     worker_id: int,
     worker_count: int,
     target_states: int,
+    phase_targets: dict[str, int] | None,
     max_games: int,
     output: str,
 ) -> dict[str, Any]:
@@ -115,6 +221,8 @@ def _collect_shard(
         "joint_rescue_worlds": 0,
         "different_continuation_worlds": 0,
         "proposal_worlds": 0,
+        "build_worlds": 0,
+        "calibration_worlds": 0,
         "heldout_worlds": 0,
         "heldout_accepted_states": 0,
         "heldout_positive_states": 0,
@@ -123,6 +231,7 @@ def _collect_shard(
         "branch_errors": Counter(),
         "opponents": Counter(),
         "turns": Counter(),
+        "phases": Counter(),
     }
     path = Path(output)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -171,11 +280,29 @@ def _collect_shard(
                             and int(selection["minCount"]) == 1
                             and int(selection["maxCount"]) == 1
                             and len(selection["option"]) >= 2
+                            and (
+                                not config.heldout_option
+                                or any(
+                                    int(option["type"]) == 7
+                                    for option in selection["option"]
+                                )
+                            )
                         )
                         turn = int(observation["current"]["turn"])
+                        phase = turn_phase(
+                            turn,
+                            early_max_turn=config.early_max_turn,
+                            mid_max_turn=config.mid_max_turn,
+                        )
+                        phase_open = (
+                            phase_targets is None
+                            or statistics["phases"][phase]
+                            < phase_targets[phase]
+                        )
                         if (
                             exact_main
                             and turn >= config.minimum_turn
+                            and phase_open
                             and statistics["states"] + len(game_records) < target_states
                             and searched_this_game < config.max_states_per_game
                         ):
@@ -221,40 +348,98 @@ def _collect_shard(
                                         normalize_rule_scores(branch_raw_scores),
                                         branch_evaluation.logits[:count].tolist(),
                                         branch_selection,
-                                        maximum=config.branch_width,
+                                        maximum=max(
+                                            config.branch_width,
+                                            config.plan_pool_size,
+                                        ),
                                     )
 
-                                evaluator_type = (
-                                    HeldoutTurnPlanEvaluator
-                                    if config.heldout_semantic
-                                    else TurnSynergyEvaluator
-                                )
-                                evaluator_kwargs = {
+                                common_kwargs = {
                                     "beam_width": config.beam_width,
                                     "branch_width": config.branch_width,
-                                    "max_plan_steps": config.max_plan_steps,
                                     "max_rollout_steps": config.max_rollout_steps,
                                     "value_policy": value_policy,
                                 }
-                                if config.heldout_semantic:
-                                    evaluator_kwargs.update(
-                                        {
-                                            "proposal_determinizations": (
-                                                config.proposal_determinizations
+                                if config.macro_oracle:
+                                    evaluator_type = MacroPlanOracleEvaluator
+                                    evaluator_kwargs = {
+                                        **common_kwargs,
+                                        "determinizations": (
+                                            config.determinizations
+                                        ),
+                                        "max_plan_steps": (
+                                            config.max_plan_steps
+                                        ),
+                                        "plan_generator": MacroPlanGenerator(
+                                            cards,
+                                            attacks,
+                                            maximum_steps=(
+                                                config.max_plan_steps
                                             ),
-                                            "heldout_determinizations": (
-                                                config.heldout_determinizations
-                                            ),
-                                            "plan_pool_size": config.plan_pool_size,
-                                            "selection_risk_multiplier": (
-                                                config.selection_risk_multiplier
-                                            ),
-                                        }
-                                    )
+                                        ),
+                                        "decision_encoder": encoder.encode,
+                                        "plan_pool_size": (
+                                            config.plan_pool_size
+                                        ),
+                                        "alignment_weight": (
+                                            config.macro_alignment_weight
+                                        ),
+                                    }
+                                elif config.heldout_option:
+                                    evaluator_type = HeldoutCardEffectEvaluator
+                                    evaluator_kwargs = {
+                                        **common_kwargs,
+                                        "build_determinizations": (
+                                            config.build_determinizations
+                                        ),
+                                        "calibration_determinizations": (
+                                            config.calibration_determinizations
+                                        ),
+                                        "heldout_determinizations": (
+                                            config.heldout_determinizations
+                                        ),
+                                        "root_candidate_limit": (
+                                            config.plan_pool_size
+                                        ),
+                                        "selection_risk_multiplier": (
+                                            config.option_gate_multiplier
+                                        ),
+                                        "max_option_steps": (
+                                            config.max_option_steps
+                                        ),
+                                        "minimum_calibration_pairs": (
+                                            config.option_min_calibration_pairs
+                                        ),
+                                        "minimum_closed_loop_coverage": (
+                                            config.option_min_coverage
+                                        ),
+                                        "familywise_alpha": (
+                                            config.option_familywise_alpha
+                                        ),
+                                    }
+                                elif config.heldout_semantic:
+                                    evaluator_type = HeldoutTurnPlanEvaluator
+                                    evaluator_kwargs = {
+                                        **common_kwargs,
+                                        "max_plan_steps": config.max_plan_steps,
+                                        "proposal_determinizations": (
+                                            config.proposal_determinizations
+                                        ),
+                                        "heldout_determinizations": (
+                                            config.heldout_determinizations
+                                        ),
+                                        "plan_pool_size": config.plan_pool_size,
+                                        "selection_risk_multiplier": (
+                                            config.selection_risk_multiplier
+                                        ),
+                                    }
                                 else:
-                                    evaluator_kwargs["determinizations"] = (
-                                        config.determinizations
-                                    )
+                                    evaluator_type = TurnSynergyEvaluator
+                                    evaluator_kwargs = {
+                                        **common_kwargs,
+                                        "max_plan_steps": config.max_plan_steps,
+                                        "determinizations": config.determinizations,
+                                    }
                                 evaluator = evaluator_type(
                                     determinizer,
                                     partial(
@@ -279,10 +464,47 @@ def _collect_shard(
                                 except Exception as error:
                                     statistics["search_failures"] += 1
                                     statistics["search_errors"][
-                                        type(error).__name__
+                                        f"{type(error).__name__}: {error}"
                                     ] += 1
                                 else:
-                                    if config.heldout_semantic:
+                                    if config.heldout_option:
+                                        calibration_pairs = int(
+                                            diagnostic[
+                                                "calibration_selected"
+                                            ]["effective_pairs"]
+                                        )
+                                        heldout_pairs = int(
+                                            diagnostic["heldout_selected"][
+                                                "effective_pairs"
+                                            ]
+                                        )
+                                        statistics["build_worlds"] += int(
+                                            diagnostic[
+                                                "build_determinizations"
+                                            ]
+                                        )
+                                        statistics[
+                                            "calibration_worlds"
+                                        ] += calibration_pairs
+                                        statistics[
+                                            "heldout_worlds"
+                                        ] += heldout_pairs
+                                        statistics[
+                                            "heldout_accepted_states"
+                                        ] += int(
+                                            diagnostic["heldout_accepted"]
+                                        )
+                                        statistics[
+                                            "heldout_positive_states"
+                                        ] += int(
+                                            float(
+                                                diagnostic[
+                                                    "deployable_heldout_gain"
+                                                ]
+                                            )
+                                            > 0.0
+                                        )
+                                    elif config.heldout_semantic:
                                         proposal_pairs = int(
                                             diagnostic["proposal_selected"][
                                                 "effective_pairs"
@@ -350,6 +572,13 @@ def _collect_shard(
                                     statistics["branch_errors"].update(
                                         diagnostic["branch_errors"]
                                     )
+                                    if (
+                                        config.compact_macro_oracle
+                                        and config.macro_oracle
+                                    ):
+                                        diagnostic = compact_macro_diagnostic(
+                                            diagnostic
+                                        )
                                     record = {
                                         "schema_version": 1,
                                         "diagnostic_kind": diagnostic.get(
@@ -377,6 +606,7 @@ def _collect_shard(
                                     searched_this_game += 1
                                     statistics["selection_reasons"][reason] += 1
                                     statistics["turns"][turn] += 1
+                                    statistics["phases"][phase] += 1
                     else:
                         action = opponent.choose_action(observation)
                     observation = engine.select(action)
@@ -424,6 +654,7 @@ def _merge_statistics(items: list[dict[str, Any]]) -> dict[str, Any]:
         "branch_errors",
         "opponents",
         "turns",
+        "phases",
     }
     merged: dict[str, Any] = {
         key: Counter() if key in counters else 0 for key in items[0]
@@ -450,6 +681,16 @@ def collect_parallel(
         target_states // worker_count + int(worker < target_states % worker_count)
         for worker in range(worker_count)
     ]
+    phase_targets = (
+        split_phase_quotas(config.phase_quotas, worker_count)
+        if config.phase_quotas is not None
+        else [None] * worker_count
+    )
+    if config.phase_quotas is not None:
+        targets = [
+            sum(worker_targets.values())
+            for worker_targets in phase_targets
+        ]
     games = [
         max_games // worker_count + int(worker < max_games % worker_count)
         for worker in range(worker_count)
@@ -464,6 +705,7 @@ def collect_parallel(
             worker_id=0,
             worker_count=1,
             target_states=targets[0],
+            phase_targets=phase_targets[0],
             max_games=games[0],
             output=str(parts[0]),
         )
@@ -482,6 +724,7 @@ def collect_parallel(
                     worker_id=worker,
                     worker_count=worker_count,
                     target_states=targets[worker],
+                    phase_targets=phase_targets[worker],
                     max_games=games[worker],
                     output=str(parts[worker]),
                 )
@@ -621,6 +864,92 @@ def summarize_turn_synergy(path: Path) -> dict[str, Any]:
     }
 
 
+def summarize_macro_oracle(path: Path) -> dict[str, Any]:
+    """Aggregate macro upper bounds and search-teacher dataset volume."""
+    summary = summarize_turn_synergy(path)
+    states = 0
+    candidate_plans = 0
+    beam_trajectories = 0
+    beam_executor_rows = 0
+    teacher_trajectories = 0
+    teacher_executor_rows = 0
+    positive_trajectories = 0
+    synergy_trajectories = 0
+    best_plan_types: Counter[str] = Counter()
+    proposed_plan_types: Counter[str] = Counter()
+    with path.open(encoding="utf-8") as stream:
+        for line in stream:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            diagnostic = record["diagnostic"]
+            states += 1
+            candidate_plans += int(diagnostic["candidate_plans"])
+            serialization = diagnostic.get("serialization") or {}
+            compact = serialization.get("mode") == "best_per_plan_compact"
+            if compact:
+                beam_trajectories += int(
+                    serialization["beam_trajectories"]
+                )
+                beam_executor_rows += int(
+                    serialization["beam_executor_rows"]
+                )
+            for plan in diagnostic["plans"]:
+                proposed_plan_types[str(plan["plan_type"])] += 1
+            for sample in diagnostic["samples"]:
+                if "error" in sample:
+                    continue
+                best_plan_types[
+                    str(sample["best_macro"]["plan_type"])
+                ] += 1
+                for item in sample["plans"]:
+                    best = item["best_trajectory"]
+                    teacher_trajectories += 1
+                    teacher_executor_rows += int(best["decision_count"])
+                    positive_trajectories += int(
+                        float(best["paired_advantage"]) > 0.0
+                    )
+                    synergy_trajectories += int(
+                        float(best["macro_synergy"]) > 0.0
+                    )
+                    if not compact:
+                        for trajectory in item["trajectories"]:
+                            beam_trajectories += 1
+                            beam_executor_rows += int(
+                                trajectory["decision_count"]
+                            )
+
+    def rate(numerator: int, denominator: int) -> float:
+        return round(numerator / denominator, 6) if denominator else 0.0
+
+    return {
+        **summary,
+        "mean_candidate_plans": round(
+            candidate_plans / states, 6
+        ) if states else 0.0,
+        "beam_trajectories": beam_trajectories,
+        "beam_executor_rows": beam_executor_rows,
+        "teacher_trajectories": teacher_trajectories,
+        "estimated_executor_rows": teacher_executor_rows,
+        "positive_teacher_trajectory_rate": rate(
+            positive_trajectories, teacher_trajectories
+        ),
+        "synergistic_teacher_trajectory_rate": rate(
+            synergy_trajectories, teacher_trajectories
+        ),
+        "proposed_plan_type_counts": dict(
+            sorted(proposed_plan_types.items())
+        ),
+        "best_plan_type_counts": dict(sorted(best_plan_types.items())),
+        "warning": (
+            "Each macro candidate receives its own full-turn beam, but the best "
+            "continuation is still selected separately per hidden world. This "
+            "is an oracle upper bound and search-teacher dataset, not a "
+            "deployable macro selector."
+        ),
+    }
+
+
 def summarize_heldout_turn_plans(path: Path) -> dict[str, Any]:
     """Aggregate state-level gains from plans selected without held-out worlds."""
     states = 0
@@ -731,6 +1060,195 @@ def summarize_heldout_turn_plans(path: Path) -> dict[str, Any]:
     }
 
 
+def summarize_heldout_options(path: Path) -> dict[str, Any]:
+    """Aggregate deployable gains and coverage of closed-loop effect policies."""
+    states = 0
+    gated = 0
+    raw_positive = 0
+    deployable_positive = 0
+    accepted = 0
+    calibration_gains: list[float] = []
+    heldout_gains: list[float] = []
+    deployable_gains: list[float] = []
+    gated_heldout_gains: list[float] = []
+    coverages: list[float] = []
+    compiled_counts: list[float] = []
+    fallback_steps = 0
+    continuation_steps = 0
+    continuation_worlds = 0
+    states_with_continuation = 0
+    by_opponent: dict[str, Counter] = {}
+    by_turn: dict[int, Counter] = {}
+    with path.open(encoding="utf-8") as stream:
+        for line in stream:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            diagnostic = record["diagnostic"]
+            calibration = diagnostic.get(
+                "calibration_selected",
+                diagnostic.get("proposal_selected"),
+            )
+            if calibration is None:
+                raise KeyError("Missing calibration/proposal selected summary")
+            heldout = diagnostic["heldout_selected"]
+            calibration_gain = float(
+                calibration.get("paired_advantage") or 0.0
+            )
+            heldout_gain = float(heldout.get("paired_advantage") or 0.0)
+            coverage = float(heldout["mean_closed_loop_coverage"])
+            state_continuation_steps = int(heldout["continuation_steps"])
+            state_continuation_worlds = int(heldout["continuation_worlds"])
+            is_gated = bool(
+                diagnostic.get(
+                    "calibration_gate_passed",
+                    diagnostic.get("proposal_gate_passed", False),
+                )
+            )
+            deployable_gain = float(
+                diagnostic.get(
+                    "deployable_heldout_gain",
+                    heldout_gain if is_gated else 0.0,
+                )
+            )
+            is_raw_positive = heldout_gain > 0.0
+            is_deployable_positive = deployable_gain > 0.0
+            is_accepted = bool(diagnostic["heldout_accepted"])
+            states += 1
+            gated += int(is_gated)
+            raw_positive += int(is_raw_positive)
+            deployable_positive += int(is_deployable_positive)
+            accepted += int(is_accepted)
+            calibration_gains.append(calibration_gain)
+            heldout_gains.append(heldout_gain)
+            deployable_gains.append(deployable_gain)
+            if is_gated:
+                gated_heldout_gains.append(heldout_gain)
+            if state_continuation_worlds:
+                coverages.append(coverage)
+            compiled_counts.append(float(diagnostic["compiled_policies"]))
+            fallback_steps += int(heldout["fallback_steps"])
+            continuation_steps += state_continuation_steps
+            continuation_worlds += state_continuation_worlds
+            states_with_continuation += int(state_continuation_worlds > 0)
+            opponent_counts = by_opponent.setdefault(record["opponent"], Counter())
+            turn_counts = by_turn.setdefault(int(record["turn"]), Counter())
+            for counts in (opponent_counts, turn_counts):
+                counts["states"] += 1
+                counts["gated"] += int(is_gated)
+                counts["raw_positive"] += int(is_raw_positive)
+                counts["deployable_positive"] += int(
+                    is_deployable_positive
+                )
+                counts["accepted"] += int(is_accepted)
+                counts["raw_gain_sum"] += heldout_gain
+                counts["deployable_gain_sum"] += deployable_gain
+                if state_continuation_worlds:
+                    counts["coverage_sum"] += coverage
+                    counts["coverage_states"] += 1
+
+    def rate(numerator: int, denominator: int) -> float:
+        return round(numerator / denominator, 6) if denominator else 0.0
+
+    def mean(values: list[float]) -> float:
+        return round(statistics.mean(values), 6) if values else 0.0
+
+    def mean_ci95(values: list[float]) -> list[float]:
+        if not values:
+            return [0.0, 0.0]
+        center = statistics.mean(values)
+        stderr = (
+            statistics.stdev(values) / math.sqrt(len(values))
+            if len(values) > 1
+            else 0.0
+        )
+        return [
+            round(center - 1.96 * stderr, 6),
+            round(center + 1.96 * stderr, 6),
+        ]
+
+    def groups(values: dict) -> dict:
+        return {
+            str(name): {
+                "states": counts["states"],
+                "calibration_gate_rate": rate(
+                    counts["gated"], counts["states"]
+                ),
+                "raw_positive_heldout_rate": rate(
+                    counts["raw_positive"], counts["states"]
+                ),
+                "deployable_positive_rate": rate(
+                    counts["deployable_positive"], counts["states"]
+                ),
+                "accepted_rate": rate(
+                    counts["accepted"], counts["states"]
+                ),
+                "mean_raw_heldout_gain": round(
+                    counts["raw_gain_sum"] / max(1, counts["states"]), 6
+                ),
+                "mean_deployable_heldout_gain": round(
+                    counts["deployable_gain_sum"]
+                    / max(1, counts["states"]),
+                    6,
+                ),
+                "mean_closed_loop_coverage": round(
+                    counts["coverage_sum"]
+                    / max(1, counts["coverage_states"]),
+                    6,
+                ),
+            }
+            for name, counts in sorted(values.items())
+        }
+
+    calibration_optimism = [
+        calibration - heldout
+        for calibration, heldout in zip(
+            calibration_gains, heldout_gains, strict=True
+        )
+    ]
+    return {
+        "states": states,
+        "calibration_gate_states": gated,
+        "calibration_gate_rate": rate(gated, states),
+        "raw_positive_heldout_states": raw_positive,
+        "raw_positive_heldout_rate": rate(raw_positive, states),
+        "deployable_positive_states": deployable_positive,
+        "deployable_positive_rate": rate(deployable_positive, states),
+        "accepted_heldout_states": accepted,
+        "accepted_heldout_rate": rate(accepted, states),
+        "mean_calibration_gain": mean(calibration_gains),
+        "mean_raw_heldout_gain": mean(heldout_gains),
+        "mean_raw_heldout_gain_ci95": mean_ci95(heldout_gains),
+        "mean_deployable_heldout_gain": mean(deployable_gains),
+        "mean_deployable_heldout_gain_ci95": mean_ci95(
+            deployable_gains
+        ),
+        "mean_gated_heldout_gain": mean(gated_heldout_gains),
+        "mean_gated_heldout_gain_ci95": mean_ci95(
+            gated_heldout_gains
+        ),
+        "mean_calibration_optimism_gap": mean(
+            calibration_optimism
+        ),
+        "states_with_continuation": states_with_continuation,
+        "continuation_worlds": continuation_worlds,
+        "continuation_steps": continuation_steps,
+        "mean_closed_loop_coverage": mean(coverages),
+        "heldout_fallback_steps": fallback_steps,
+        "closed_loop_step_coverage": round(
+            1.0 - fallback_steps / max(1, continuation_steps), 6
+        ),
+        "mean_compiled_policies": mean(compiled_counts),
+        "by_opponent": groups(by_opponent),
+        "by_turn": groups(by_turn),
+        "warning": (
+            "Build worlds compile policies, calibration worlds select and gate "
+            "them, and held-out worlds only evaluate. Deployable gain is zero "
+            "whenever the independent calibration gate rejects an override."
+        ),
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--expert-source", type=Path, required=True)
@@ -747,16 +1265,39 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-games", type=int, default=240)
     parser.add_argument("--determinizations", type=int, default=4)
     parser.add_argument("--heldout-semantic", action="store_true")
+    parser.add_argument("--heldout-option", action="store_true")
+    parser.add_argument("--macro-oracle", action="store_true")
+    parser.add_argument(
+        "--compact-macro-oracle",
+        action="store_true",
+        help=(
+            "After full macro search, omit non-best beam trajectories from "
+            "JSON without changing search or teacher selection."
+        ),
+    )
+    parser.add_argument("--build-determinizations", type=int, default=8)
+    parser.add_argument("--calibration-determinizations", type=int, default=8)
     parser.add_argument("--proposal-determinizations", type=int, default=4)
     parser.add_argument("--heldout-determinizations", type=int, default=4)
     parser.add_argument("--plan-pool-size", type=int, default=16)
     parser.add_argument("--selection-risk-multiplier", type=float, default=1.0)
+    parser.add_argument("--option-gate-multiplier", type=float, default=1.96)
+    parser.add_argument("--option-min-calibration-pairs", type=int, default=8)
+    parser.add_argument("--option-min-coverage", type=float, default=0.9)
+    parser.add_argument("--option-familywise-alpha", type=float, default=0.05)
+    parser.add_argument("--macro-alignment-weight", type=float, default=0.05)
     parser.add_argument("--beam-width", type=int, default=8)
     parser.add_argument("--branch-width", type=int, default=4)
     parser.add_argument("--max-plan-steps", type=int, default=32)
+    parser.add_argument("--max-option-steps", type=int, default=12)
     parser.add_argument("--max-rollout-steps", type=int, default=1_000)
     parser.add_argument("--max-states-per-game", type=int, default=1)
     parser.add_argument("--minimum-turn", type=int, default=3)
+    parser.add_argument("--early-states", type=int, default=0)
+    parser.add_argument("--mid-states", type=int, default=0)
+    parser.add_argument("--late-states", type=int, default=0)
+    parser.add_argument("--early-max-turn", type=int, default=4)
+    parser.add_argument("--mid-max-turn", type=int, default=7)
     parser.add_argument("--random-state-probability", type=float, default=0.25)
     parser.add_argument("--low-margin-threshold", type=float, default=0.25)
     parser.add_argument("--workers", type=int, default=1)
@@ -774,16 +1315,25 @@ def main(argv: list[str] | None = None) -> int:
         "target-states": args.target_states,
         "max-games": args.max_games,
         "determinizations": (
-            args.proposal_determinizations + args.heldout_determinizations
+            args.build_determinizations
+            + args.calibration_determinizations
+            + args.heldout_determinizations
+            if args.heldout_option
+            else args.proposal_determinizations
+            + args.heldout_determinizations
             if args.heldout_semantic
             else args.determinizations
         ),
+        "build-determinizations": args.build_determinizations,
+        "calibration-determinizations": args.calibration_determinizations,
         "proposal-determinizations": args.proposal_determinizations,
         "heldout-determinizations": args.heldout_determinizations,
         "plan-pool-size": args.plan_pool_size,
         "beam-width": args.beam_width,
         "branch-width": args.branch_width,
         "max-plan-steps": args.max_plan_steps,
+        "max-option-steps": args.max_option_steps,
+        "option-min-calibration-pairs": args.option_min_calibration_pairs,
         "max-rollout-steps": args.max_rollout_steps,
         "max-states-per-game": args.max_states_per_game,
         "minimum-turn": args.minimum_turn,
@@ -797,6 +1347,57 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--random-state-probability must be in [0, 1]")
     if args.selection_risk_multiplier < 0:
         raise SystemExit("--selection-risk-multiplier must be non-negative")
+    if args.option_gate_multiplier < 0:
+        raise SystemExit("--option-gate-multiplier must be non-negative")
+    if args.macro_alignment_weight < 0:
+        raise SystemExit("--macro-alignment-weight must be non-negative")
+    if not 0.0 <= args.option_min_coverage <= 1.0:
+        raise SystemExit("--option-min-coverage must be in [0, 1]")
+    if not 0.0 < args.option_familywise_alpha < 1.0:
+        raise SystemExit("--option-familywise-alpha must be in (0, 1)")
+    if args.early_max_turn >= args.mid_max_turn:
+        raise SystemExit("--early-max-turn must be smaller than --mid-max-turn")
+    raw_phase_quotas = (
+        args.early_states,
+        args.mid_states,
+        args.late_states,
+    )
+    if any(value < 0 for value in raw_phase_quotas):
+        raise SystemExit("phase state quotas must be non-negative")
+    phase_quotas = (
+        raw_phase_quotas if any(raw_phase_quotas) else None
+    )
+    if phase_quotas is not None and sum(phase_quotas) != args.target_states:
+        raise SystemExit(
+            "--early-states + --mid-states + --late-states must equal "
+            "--target-states"
+        )
+    if (
+        phase_quotas is not None
+        and phase_quotas[0] > 0
+        and args.minimum_turn > args.early_max_turn
+    ):
+        raise SystemExit("early quota is unreachable above --minimum-turn")
+    if (
+        phase_quotas is not None
+        and phase_quotas[1] > 0
+        and args.minimum_turn > args.mid_max_turn
+    ):
+        raise SystemExit("mid quota is unreachable above --minimum-turn")
+    diagnostic_modes = sum(
+        (
+            args.heldout_semantic,
+            args.heldout_option,
+            args.macro_oracle,
+        )
+    )
+    if diagnostic_modes > 1:
+        raise SystemExit(
+            "--heldout-semantic, --heldout-option, and --macro-oracle are "
+            "mutually exclusive"
+        )
+    if args.compact_macro_oracle and not args.macro_oracle:
+        raise SystemExit("--compact-macro-oracle requires --macro-oracle")
     engine = OfficialEngine(args.official_dir)
     expert_source = args.expert_source.expanduser().resolve()
     expert_deck = args.expert_deck.expanduser().resolve()
@@ -836,10 +1437,24 @@ def main(argv: list[str] | None = None) -> int:
         seed=args.seed,
         torch_threads=args.torch_threads,
         heldout_semantic=args.heldout_semantic,
+        heldout_option=args.heldout_option,
+        macro_oracle=args.macro_oracle,
+        build_determinizations=args.build_determinizations,
+        calibration_determinizations=args.calibration_determinizations,
         proposal_determinizations=args.proposal_determinizations,
         heldout_determinizations=args.heldout_determinizations,
         plan_pool_size=args.plan_pool_size,
         selection_risk_multiplier=args.selection_risk_multiplier,
+        max_option_steps=args.max_option_steps,
+        option_gate_multiplier=args.option_gate_multiplier,
+        option_min_calibration_pairs=args.option_min_calibration_pairs,
+        option_min_coverage=args.option_min_coverage,
+        option_familywise_alpha=args.option_familywise_alpha,
+        macro_alignment_weight=args.macro_alignment_weight,
+        compact_macro_oracle=args.compact_macro_oracle,
+        phase_quotas=phase_quotas,
+        early_max_turn=args.early_max_turn,
+        mid_max_turn=args.mid_max_turn,
     )
     output = args.output.expanduser().resolve()
     started = perf_counter()
@@ -857,31 +1472,79 @@ def main(argv: list[str] | None = None) -> int:
         "branch_errors",
         "opponents",
         "turns",
+        "phases",
     ):
         raw[key] = dict(sorted(raw[key].items()))
+    requested_phases = (
+        dict(zip(TURN_PHASES, phase_quotas, strict=True))
+        if phase_quotas is not None
+        else None
+    )
+    phase_shortfalls = (
+        {
+            phase: max(
+                0,
+                requested - int(raw["phases"].get(phase, 0)),
+            )
+            for phase, requested in requested_phases.items()
+        }
+        if requested_phases is not None
+        else None
+    )
     summary = {
         **raw,
         "diagnostic_mode": (
-            "heldout_semantic" if args.heldout_semantic else "oracle"
+            "macro_oracle"
+            if args.macro_oracle
+            else "heldout_option"
+            if args.heldout_option
+            else "heldout_semantic"
+            if args.heldout_semantic
+            else "oracle"
         ),
         "target_states": args.target_states,
         "determinizations": (
-            args.proposal_determinizations + args.heldout_determinizations
+            args.build_determinizations
+            + args.calibration_determinizations
+            + args.heldout_determinizations
+            if args.heldout_option
+            else args.proposal_determinizations
+            + args.heldout_determinizations
             if args.heldout_semantic
             else args.determinizations
         ),
+        "build_determinizations": args.build_determinizations,
+        "calibration_determinizations": args.calibration_determinizations,
         "proposal_determinizations": args.proposal_determinizations,
         "heldout_determinizations": args.heldout_determinizations,
         "plan_pool_size": args.plan_pool_size,
         "beam_width": args.beam_width,
         "branch_width": args.branch_width,
+        "max_option_steps": args.max_option_steps,
+        "option_gate_multiplier": args.option_gate_multiplier,
+        "option_min_calibration_pairs": args.option_min_calibration_pairs,
+        "option_min_coverage": args.option_min_coverage,
+        "option_familywise_alpha": args.option_familywise_alpha,
+        "macro_alignment_weight": args.macro_alignment_weight,
         "minimum_turn": args.minimum_turn,
+        "compact_macro_oracle": args.compact_macro_oracle,
+        "turn_phase_boundaries": {
+            "early": [args.minimum_turn, args.early_max_turn],
+            "mid": [args.early_max_turn + 1, args.mid_max_turn],
+            "late": [args.mid_max_turn + 1, None],
+        },
+        "requested_phase_states": requested_phases,
+        "phase_shortfalls": phase_shortfalls,
         "seed": args.seed,
         "workers": min(args.workers, args.target_states),
         "elapsed_seconds": round(elapsed, 3),
         "states_per_second": round(raw["states"] / elapsed, 6),
         "diagnostics": (
-            summarize_heldout_turn_plans(output)
+            summarize_macro_oracle(output)
+            if args.macro_oracle
+            else summarize_heldout_options(output)
+            if args.heldout_option
+            else summarize_heldout_turn_plans(output)
             if args.heldout_semantic
             else summarize_turn_synergy(output)
         ),

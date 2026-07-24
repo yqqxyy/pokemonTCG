@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import fcntl
+import hashlib
 import json
 import os
 import sys
+import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -47,6 +50,21 @@ def _working_directory(path: Path) -> Iterator[None]:
         os.chdir(previous)
 
 
+@contextmanager
+def _source_load_lock(path: Path) -> Iterator[None]:
+    """Serialize public-agent imports that rewrite files beside their source."""
+    digest = hashlib.blake2b(
+        str(path.resolve()).encode(), digest_size=12
+    ).hexdigest()
+    lock_path = Path(tempfile.gettempdir()) / f"poketcg-external-{digest}.lock"
+    with lock_path.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
 class ExternalPythonAgent:
     """Load a trusted public ``agent(obs)`` implementation from a local artifact.
 
@@ -86,7 +104,9 @@ class ExternalPythonAgent:
             "__file__": str(self._source_path),
             "__name__": f"poketcg_external_{self._external_name}",
         }
-        with _working_directory(self._resolved_deck.parent):
+        with _source_load_lock(self._resolved_deck), _working_directory(
+            self._resolved_deck.parent
+        ):
             exec(
                 compile(
                     _agent_source(self._source_path),

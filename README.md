@@ -778,6 +778,239 @@ held-out gain 接近零，说明搜索在拟合少量 sampled worlds；replay su
 表示仍依赖不稳定的物理下标。只有 held-out 收益稳定为正、重放率接近 1 的计划，才适合进入
 下一阶段的监督数据构建；`heldout_accepted` 是诊断标签，不会在同一批数据上重新选择计划。
 
+#### Held-out 闭环 Card-effect Option
+
+固定 Turn Plan 要求不同 hidden worlds 执行同一动作序列，无法适应抽牌、搜索结果和后续
+option context 的变化。`--heldout-option` 将实验限制为 `PLAY` 根动作，并把 Build 搜索
+轨迹编译成闭环 continuation policy：
+
+```text
+完整公开状态指纹 → 语义动作
+当前语义选择集合 → 语义动作
+未匹配或无法解析 → 仅当前一步退回 V1
+```
+
+公开状态指纹不包含物理 option 下标、卡牌 serial、对手手牌内容或隐藏牌库顺序。每个新
+effect context 都根据当时的可见状态重新查表，因此它不是固定动作序列。评测使用严格三段式
+数据隔离：
+
+1. Build worlds 只搜索轨迹并编译 closed-loop policy；
+2. Calibration worlds 独立选择 policy，并决定是否允许覆盖 V1；
+3. Held-out worlds 只做最终评测，不能反向修改 gate。
+
+Calibration gate 同时要求：Bonferroni 多候选修正后的 LCB 大于零、有效 paired samples
+达到下限、closed-loop coverage 达到下限。`--heldout-option` 与 `--heldout-semantic` 不能
+同时使用。
+
+先运行 12 状态 screen：
+
+```bash
+python -m poketcg.rl.collect_turn_synergy \
+  --heldout-option \
+  --expert-source artifacts/public_agents/libraryout_1208/main.py \
+  --expert-deck artifacts/public_agents/libraryout_1208/deck.csv \
+  --checkpoint artifacts/checkpoints/libraryout_residual_round0.pt \
+  --mirror \
+  --external-opponent strong_start=artifacts/public_agents/strong_start_v10/main.py,artifacts/public_agents/strong_start_v10/deck.csv \
+  --external-opponent baseline1084=artifacts/public_agents/baseline_1084/main.py,artifacts/public_agents/baseline_1084/deck.csv \
+  --target-states 12 --max-games 120 \
+  --build-determinizations 4 \
+  --calibration-determinizations 8 \
+  --heldout-determinizations 8 \
+  --plan-pool-size 8 \
+  --option-gate-multiplier 1.96 \
+  --option-min-calibration-pairs 8 \
+  --option-min-coverage 0.9 \
+  --option-familywise-alpha 0.05 \
+  --beam-width 8 --branch-width 4 --max-option-steps 12 \
+  --max-states-per-game 1 --minimum-turn 3 \
+  --workers 4 --torch-threads 1 --seed 20260811 \
+  --output data/processed/libraryout_threeway_option_screen12_b4c8h8.jsonl
+```
+
+相邻 summary 重点检查：
+
+- `search_failures`、`search_errors`、`branch_errors` 必须为零；
+- `states_with_continuation` 确认采到的不是全部即时 PLAY；
+- `closed_loop_step_coverage` 衡量后续选择由编译 policy 接管的比例；
+- `calibration_gate_rate` 是独立 calibration 真正允许覆盖 V1 的状态比例；
+- `mean_raw_heldout_gain` 用于诊断被选候选本身的泛化能力；
+- `mean_gated_heldout_gain` 只统计通过 calibration gate 的状态；
+- `mean_deployable_heldout_gain` 将 gate 未通过的状态收益记为零，是最重要的部署指标；
+- `mean_calibration_optimism_gap` 用于识别选择过程仍存在的 winner's curse。
+
+即时完成、不产生后续 context 的 PLAY 不参与 continuation coverage 的分母。held-out 中未见
+状态的 fallback 是预期安全行为，但正式扩大数据前 step coverage 应尽量接近 1。不能根据
+held-out 中哪些状态表现好再次筛选训练标签；下一轮模型选择必须使用新的独立数据。
+
+#### 宏策略学习阶段 0：Library-Out PlanOption oracle 与 Executor 教师数据
+
+单状态 Card-effect Option 无法稳定泛化后，不再训练单步 reranker。`--macro-oracle` 把一个
+完整回合作为学习单位。第一版通用 effect-tag 分类已经弃用；当前
+`strategy_version=libraryout_v2` 根据 Great Tusk / Crustle 牌组的实际胜利闭环生成计划：
+
+```text
+Explorer's Guidance / Ancient Supporter
+  -> Great Tusk 使用 Land Collapse 丢弃 4 张
+  -> Crustle、Neutralization Zone、gust、hand disruption 或治疗多买一回合
+  -> 重复 mill，必要时才切换 prize race
+```
+
+每个公开根状态生成结构化 `PlanOption`：
+
+```text
+strategy version + plan type + root semantic action
++ preferred/preserved card and attack IDs
++ explicit preconditions/success conditions
++ public feasibility signals + turn ownership boundary
+```
+
+候选包括严格执行 V1 的 `baseline_v1`，以及：
+
+- `mill_four_now`：完成 Ancient Supporter + Land Collapse；
+- `find_ancient_supporter`：通过 Pokégear 找 Explorer's Guidance；
+- `prepare_next_great_tusk`：搜索、上场并为 Great Tusk 附能；
+- `build_crustle_wall` 与 `enable_neutralization_wall`：建立针对 Pokémon ex/V 的墙；
+- `gust_stall_target`、`hand_disruption_stall`、`heal_or_rotate_wall`：购买额外 mill 回合；
+- `prize_race_pivot`：仅在击倒路线改变胜负竞速时转为取奖赏卡；
+- `preserve_deck_and_chain`：控制自我 deck-out 并保存下一回合资源。
+
+候选必须由当前合法根动作支持；不会再从 baseline 动作无条件虚构通用 intent。无效计划会按
+公开状态剪枝，例如对手手牌不超过 3 张时不生成 `hand_disruption_stall`，对手没有 Bench
+时不生成 `gust_stall_target`。同一个根动作仍可带不同宏意图：例如 Ultra Ball 同时支持
+“准备 Great Tusk”和“建立 Crustle”，它们的后续搜索目标不同。这样才能检测首步相同、联合
+continuation 不同的组合收益。V1 plan 不参与自由 beam search；其他每个宏候选独占一条完整
+beam，并持续执行到攻击、换手、终局或计划步数上限。
+
+第一轮 12 状态 upper-bound screen：
+
+```bash
+python -m poketcg.rl.collect_turn_synergy \
+  --macro-oracle \
+  --expert-source artifacts/public_agents/libraryout_1208/main.py \
+  --expert-deck artifacts/public_agents/libraryout_1208/deck.csv \
+  --checkpoint artifacts/checkpoints/libraryout_residual_round0.pt \
+  --mirror \
+  --external-opponent strong_start=artifacts/public_agents/strong_start_v10/main.py,artifacts/public_agents/strong_start_v10/deck.csv \
+  --external-opponent baseline1084=artifacts/public_agents/baseline_1084/main.py,artifacts/public_agents/baseline_1084/deck.csv \
+  --target-states 12 --max-games 120 --determinizations 4 \
+  --plan-pool-size 8 --beam-width 8 --branch-width 4 \
+  --max-plan-steps 32 --macro-alignment-weight 0.05 \
+  --max-states-per-game 1 --minimum-turn 3 \
+  --workers 4 --torch-threads 1 --seed 20260818 \
+  --output data/processed/libraryout_macro_v2_screen12_det4.jsonl
+```
+
+`mean_full_turn_oracle_gain` 是完整宏策略相对 V1 的理论上限，
+`mean_synergy_gain` 和 `joint_rescue_rate` 专门衡量单改根动作失败、但联合 continuation
+获益的情况。`best_plan_type_counts` 检查上限是否集中在可解释的显式计划，而不是
+`baseline_v1`。`beam_trajectories` / `beam_executor_rows` 是搜索探索过的全部叶子；
+`teacher_trajectories` / `estimated_executor_rows` 只统计每个 hidden world、每个宏计划的
+最佳完整轨迹，后者才是 Executor 数据规模。oracle 在每个 hidden world 内选择最佳
+continuation，不能直接部署，也不能当作固定 Executor 的最终 Plan Advantage 标签。
+
+把嵌套搜索结果拆成两个数据集：
+
+```bash
+python -m poketcg.rl.macro_data \
+  --input data/processed/libraryout_macro_v2_screen12_det4.jsonl \
+  --output data/processed/libraryout_macro_v2_executor_best_screen12.jsonl \
+  --plan-output data/processed/libraryout_macro_v2_plan_value_screen12.jsonl
+```
+
+Executor 数据只保留每个 world、每个 plan 的 `best_trajectory`，不会把 beam 中的次优叶子
+当成相互冲突的动作标签。每行只有 `executor_input.decision`、`executor_input.plan` 和
+`executor_input.progress` 可以进入 Executor；`determinization_id`、return、advantage 和
+macro synergy 只是审计元数据。
+
+Plan-Value 数据每个公开根状态和 plan 只有一行，`selector_input` 仅含根
+`decision + plan`；`labels` 是跨 determinizations 聚合的 oracle return、paired advantage、
+stderr、置信区间和 macro synergy。它可用于上限预训练或排序诊断，但标签仍来自
+hidden-world oracle continuation，不能冒充冻结 Executor 的可部署收益。正式 Plan Selector
+必须在 Executor 冻结后重新采集 fixed-Executor paired returns。
+
+两个数据集共用 `split_group`，按整局划分 train/calibration/held-out，禁止把同一局的动作或
+plan 拆到不同 split。
+旧 `macro_plan_oracle_v1` 文件仍可由 `PlanOption.from_dict` 读取，但不能与 v2 教师数据混合
+训练；新诊断的 `diagnostic_kind` 为 `macro_plan_oracle_v2_libraryout`。
+
+#### Compact、分阶段的宏策略正式采集
+
+完整 beam JSON 会重复保存大量未入选叶子的 decision tensor。`--compact-macro-oracle`
+不会改变 candidate、beam search、determinizations、return 或 best trajectory 选择；搜索
+全部完成后才删除非 best 叶子的完整 step payload，并保留原始 beam 轨迹数和行数。它不损失
+Executor 教师或 Plan-Value 标签质量，但不能再用于逐条分析未入选 beam 叶子。
+
+阶段配额在搜索前生效，默认边界为：
+
+- `early`：Turn 3–4；
+- `mid`：Turn 5–7；
+- `late`：Turn 8+。
+
+每个 worker 会得到精确的分阶段子配额，最终 summary 的 `phases` 应等于
+`requested_phase_states`，且所有 `phase_shortfalls` 必须为 0。
+
+Colab High-RAM 先运行 30 状态 pilot。建议先写 Colab 本地盘，完成后再复制到 Drive，避免
+多进程持续写 Google Drive：
+
+```bash
+python -m poketcg.rl.collect_turn_synergy \
+  --macro-oracle --compact-macro-oracle \
+  --expert-source artifacts/public_agents/libraryout_1208/main.py \
+  --expert-deck artifacts/public_agents/libraryout_1208/deck.csv \
+  --checkpoint artifacts/checkpoints/libraryout_residual_round0.pt \
+  --mirror \
+  --external-opponent strong_start=artifacts/public_agents/strong_start_v10/main.py,artifacts/public_agents/strong_start_v10/deck.csv \
+  --external-opponent baseline1084=artifacts/public_agents/baseline_1084/main.py,artifacts/public_agents/baseline_1084/deck.csv \
+  --target-states 30 --early-states 10 --mid-states 12 --late-states 8 \
+  --max-games 600 --determinizations 8 \
+  --plan-pool-size 8 --beam-width 8 --branch-width 4 \
+  --max-plan-steps 32 --macro-alignment-weight 0.05 \
+  --max-states-per-game 1 --minimum-turn 3 \
+  --workers 8 --torch-threads 1 --seed 20260822 \
+  --output /content/libraryout_macro_v2_compact_pilot30_det8.jsonl
+```
+
+pilot 必须满足：`states=30`、三个 `phase_shortfalls=0`、
+`effective_determinizations=240`、`search_failures=0`、`branch_errors={}`。确认后正式采集
+200 状态：
+
+```bash
+python -m poketcg.rl.collect_turn_synergy \
+  --macro-oracle --compact-macro-oracle \
+  --expert-source artifacts/public_agents/libraryout_1208/main.py \
+  --expert-deck artifacts/public_agents/libraryout_1208/deck.csv \
+  --checkpoint artifacts/checkpoints/libraryout_residual_round0.pt \
+  --mirror \
+  --external-opponent strong_start=artifacts/public_agents/strong_start_v10/main.py,artifacts/public_agents/strong_start_v10/deck.csv \
+  --external-opponent baseline1084=artifacts/public_agents/baseline_1084/main.py,artifacts/public_agents/baseline_1084/deck.csv \
+  --target-states 200 --early-states 70 --mid-states 80 --late-states 50 \
+  --max-games 4000 --determinizations 8 \
+  --plan-pool-size 8 --beam-width 8 --branch-width 4 \
+  --max-plan-steps 32 --macro-alignment-weight 0.05 \
+  --max-states-per-game 1 --minimum-turn 3 \
+  --workers 8 --torch-threads 1 --seed 20260823 \
+  --output /content/libraryout_macro_v2_compact_200_det8.jsonl
+```
+
+随后在 Colab 本地展开两个数据集，再复制三个 JSONL 和 summary 到 Drive：
+
+```bash
+python -m poketcg.rl.macro_data \
+  --input /content/libraryout_macro_v2_compact_200_det8.jsonl \
+  --output /content/libraryout_macro_v2_executor_best_200.jsonl \
+  --plan-output /content/libraryout_macro_v2_plan_value_200.jsonl
+
+mkdir -p /content/drive/MyDrive/pokemonTCG/macro
+cp /content/libraryout_macro_v2_compact_200_det8.jsonl \
+   /content/libraryout_macro_v2_compact_200_det8.summary.json \
+   /content/libraryout_macro_v2_executor_best_200.jsonl \
+   /content/libraryout_macro_v2_executor_best_200.summary.json \
+   /content/libraryout_macro_v2_plan_value_200.jsonl \
+   /content/libraryout_macro_v2_plan_value_200.summary.json \
+   /content/drive/MyDrive/pokemonTCG/macro/
+```
+
 ### Mega Lucario 显式战术规划器
 
 `TacticalPlannerAgent` 先枚举本回合可形成的攻击计划，再让后续附能、进化、换位、Boss、伤害
