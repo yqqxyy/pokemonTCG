@@ -205,6 +205,21 @@ class ClosedLoopPlanDAggerEvaluator(MacroPlanOracleEvaluator):
             progress,
             root_action,
         )
+        root_boundary = self._macro_boundary(
+            position.observation,
+            progress,
+            plan,
+        )
+        if root_boundary != "active":
+            return {
+                "plan_id": plan.plan_id,
+                "plan_type": plan.plan_type.value,
+                "plan": plan.to_dict(),
+                "labels": [],
+                "visited_states": 0,
+                "skipped_reason": "no_post_root_decision",
+                "plan_boundary": root_boundary,
+            }
         executed_steps = [root_step]
         labels: list[dict[str, Any]] = []
         teacher_steps = 0
@@ -441,7 +456,14 @@ class ClosedLoopPlanDAggerEvaluator(MacroPlanOracleEvaluator):
             for sample in samples
             if "error" not in sample
             for plan in sample["plans"]
-            if "error" not in plan
+            if "error" not in plan and "skipped_reason" not in plan
+        ]
+        skipped_plans = [
+            plan
+            for sample in samples
+            if "error" not in sample
+            for plan in sample["plans"]
+            if plan.get("skipped_reason") == "no_post_root_decision"
         ]
         if not valid_plans:
             raise RuntimeError("Every closed-loop Plan DAgger branch failed")
@@ -471,6 +493,7 @@ class ClosedLoopPlanDAggerEvaluator(MacroPlanOracleEvaluator):
             ),
             "candidate_plans": len(selected_plans),
             "plans": [plan.to_dict() for plan in selected_plans],
+            "skipped_no_post_root_decision": len(skipped_plans),
             "configured_beta": self._beta,
             "visited_states": visited,
             "teacher_steps": teacher_steps,

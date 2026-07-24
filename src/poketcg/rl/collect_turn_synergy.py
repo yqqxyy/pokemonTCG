@@ -245,6 +245,7 @@ def _collect_shard(
         "dagger_teacher_steps": 0,
         "dagger_student_steps": 0,
         "dagger_disagreements": 0,
+        "dagger_skipped_no_post_root_decision": 0,
         "selection_reasons": Counter(),
         "search_errors": Counter(),
         "branch_errors": Counter(),
@@ -551,6 +552,13 @@ def _collect_shard(
                                         ] += int(
                                             diagnostic[
                                                 "semantic_disagreements"
+                                            ]
+                                        )
+                                        statistics[
+                                            "dagger_skipped_no_post_root_decision"
+                                        ] += int(
+                                            diagnostic[
+                                                "skipped_no_post_root_decision"
                                             ]
                                         )
                                     elif config.heldout_option:
@@ -960,6 +968,7 @@ def summarize_plan_dagger(path: Path) -> dict[str, Any]:
     mixed_returns: list[float] = []
     oracle_gaps: list[float] = []
     plan_errors = 0
+    skipped_no_post_root = 0
     with path.open(encoding="utf-8") as stream:
         for line in stream:
             if not line.strip():
@@ -983,6 +992,12 @@ def summarize_plan_dagger(path: Path) -> dict[str, Any]:
                     if "error" in plan:
                         plan_errors += 1
                         continue
+                    if (
+                        plan.get("skipped_reason")
+                        == "no_post_root_decision"
+                    ):
+                        skipped_no_post_root += 1
+                        continue
                     mixed_returns.append(float(plan["mixed_return"]))
                     oracle_gaps.append(float(plan["oracle_gap"]))
     return {
@@ -1002,6 +1017,7 @@ def summarize_plan_dagger(path: Path) -> dict[str, Any]:
         if oracle_gaps
         else None,
         "plan_errors": plan_errors,
+        "skipped_no_post_root_decision": skipped_no_post_root,
         "warning": (
             "Returns are hidden-world search diagnostics. Training labels are "
             "only the oracle semantic actions at states reached by roll-in."

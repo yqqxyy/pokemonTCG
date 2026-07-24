@@ -1110,8 +1110,32 @@ python -m poketcg.rl.collect_turn_synergy \
 
 summary 中首先检查 `search_failures=0`、`branch_errors={}`，再看
 `diagnostics.visited_states`、`realized_beta`、`semantic_disagreement_rate` 和
-`mean_oracle_gap`。分歧率说明 Student 在新分布上仍有多少动作需要纠正；oracle gap 衡量混合
-roll-in 与逐状态搜索上界的差距。它们是诊断量，不进入模型输入。
+`mean_oracle_gap`。`skipped_no_post_root_decision` 统计 root action 已经结束计划、因而没有
+Executor 标签的正常分支，不属于搜索错误。分歧率说明 Student 在新分布上仍有多少动作需要
+纠正；oracle gap 衡量混合 roll-in 与逐状态搜索上界的差距。它们是诊断量，不进入模型输入。
+
+pilot 正常后，Round 1 用三类对手和 early/mid/late 配额采集 300 个根状态：
+
+```bash
+python -m poketcg.rl.collect_turn_synergy \
+  --plan-dagger \
+  --expert-source artifacts/public_agents/libraryout_1208/main.py \
+  --expert-deck artifacts/public_agents/libraryout_1208/deck.csv \
+  --checkpoint artifacts/checkpoints/libraryout_residual_round0.pt \
+  --executor-checkpoint artifacts/checkpoints/libraryout_executor_v2_semantic.pt \
+  --mirror \
+  --external-opponent strong_start=artifacts/public_agents/strong_start_v10/main.py,artifacts/public_agents/strong_start_v10/deck.csv \
+  --external-opponent baseline1084=artifacts/public_agents/baseline_1084/main.py,artifacts/public_agents/baseline_1084/deck.csv \
+  --target-states 300 --early-states 105 --mid-states 120 --late-states 75 \
+  --max-games 6000 \
+  --determinizations 4 --plan-pool-size 4 --dagger-plan-limit 2 \
+  --dagger-beta 0.5 \
+  --beam-width 4 --branch-width 3 --max-plan-steps 32 \
+  --max-states-per-game 1 --minimum-turn 3 \
+  --workers 8 --torch-threads 1 --seed 20260829 \
+  --official-dir data/official/sample_submission/sample_submission \
+  --output /content/libraryout_plan_dagger_round1_300_raw.jsonl
+```
 
 将 raw diagnostic 转成与 Executor V2 相同的 schema 3：
 

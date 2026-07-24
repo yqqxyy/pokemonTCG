@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pytest
@@ -27,6 +27,7 @@ from poketcg.rl.macro_plan import (
 from poketcg.rl.paired_rollout import RootCandidate
 from poketcg.rl.plan_dagger import ClosedLoopPlanDAggerEvaluator
 from poketcg.rl.plan_dagger_data import prepare_plan_dagger_data
+from poketcg.rl.semantic_plan import semantic_action
 
 
 def _observation(state: str, *, result: int = -1) -> dict:
@@ -594,3 +595,53 @@ def test_closed_loop_plan_dagger_relabels_student_visited_state(
         "closed_loop_dagger_visited_state"
     )
     assert rows[0]["executor_input"]["progress"]["decisions"] == 1
+
+
+def test_plan_dagger_treats_root_completed_plan_as_skip() -> None:
+    observation = _observation("root")
+    evaluator = ClosedLoopPlanDAggerEvaluator(
+        MacroDeterminizer(),
+        BaselinePolicy,
+        BaselinePolicy,
+        _candidates,
+        plan_generator=MacroPlanGenerator({}, {}, maximum_steps=4),
+        decision_encoder=lambda value: {"state": value["state"]},
+        student_policy=DeviatingPlanStudent(),
+        beta=0.5,
+        dagger_plan_limit=1,
+        determinizations=1,
+        plan_pool_size=2,
+        beam_width=2,
+        branch_width=2,
+        max_plan_steps=4,
+        backend=MacroBackend(),
+    )
+    generated = evaluator._plan_generator.generate(
+        observation,
+        _candidates(observation),
+        baseline_action=[0],
+        maximum=2,
+    )
+    root_completed_plan = replace(
+        generated[1],
+        root_action=semantic_action(observation, [0]),
+        source_action=(0,),
+    )
+    root = evaluator._backend.begin(
+        observation,
+        MacroDeterminizer().sample(observation),
+    )
+    try:
+        result = evaluator._roll_in_plan(
+            root,
+            root_completed_plan,
+            root_player=0,
+            baseline_return=-1.0,
+        )
+    finally:
+        evaluator._backend.end()
+
+    assert result["skipped_reason"] == "no_post_root_decision"
+    assert result["visited_states"] == 0
+    assert result["labels"] == []
+    assert evaluator._branch_errors == {}

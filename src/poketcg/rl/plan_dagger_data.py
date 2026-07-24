@@ -44,7 +44,10 @@ def iter_plan_dagger_examples(
             continue
         world_id = int(sample["determinization_id"])
         for plan_result in sample["plans"]:
-            if "error" in plan_result:
+            if (
+                "error" in plan_result
+                or "skipped_reason" in plan_result
+            ):
                 continue
             plan = plan_result["plan"]
             for step_index, label in enumerate(plan_result["labels"]):
