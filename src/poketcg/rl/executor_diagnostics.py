@@ -25,7 +25,14 @@ from .executor_data import (
 )
 from .model import build_model
 from .train_bc import TokenBucketBatchSampler, resolve_device
-from .train_executor import evaluation_report, move_executor_batch
+from .train_executor import (
+    PHYSICAL_TARGET_KIND,
+    SEMANTIC_TARGET_KIND,
+    evaluation_report,
+    move_executor_batch,
+)
+
+Prediction = tuple[tuple[int, ...], tuple[int, ...]]
 
 
 def _loader(dataset: ExecutorDataset, batch_size: int, seed: int) -> DataLoader:
@@ -50,9 +57,9 @@ def prediction_map(
     model,
     loader: DataLoader,
     device: torch.device,
-) -> dict[tuple[str, str, str], tuple[int, ...]]:
+) -> dict[tuple[str, str, str], Prediction]:
     model.eval()
-    predictions: dict[tuple[str, str, str], tuple[int, ...]] = {}
+    predictions: dict[tuple[str, str, str], Prediction] = {}
     with torch.no_grad():
         for raw_batch in loader:
             metadata = raw_batch["metadata"]
@@ -63,9 +70,11 @@ def prediction_map(
             option_mask = batch["option_mask"]
             minimum = batch["minimum"]
             maximum = batch["maximum"]
+            class_ids = batch["equivalence_class_ids"]
             assert isinstance(option_mask, Tensor)
             assert isinstance(minimum, Tensor)
             assert isinstance(maximum, Tensor)
+            assert isinstance(class_ids, Tensor)
             for row, item in enumerate(metadata):
                 option_count = int(option_mask[row].sum())
                 action = deterministic_subset(
@@ -76,7 +85,10 @@ def prediction_map(
                 key = _example_key(item)
                 if key in predictions:
                     raise ValueError(f"Duplicate Executor diagnostic key: {key}")
-                predictions[key] = tuple(action)
+                semantic_action = tuple(
+                    sorted(int(class_ids[row, index]) for index in action)
+                )
+                predictions[key] = (tuple(action), semantic_action)
     return predictions
 
 
@@ -191,14 +203,17 @@ def condition_variants(
 
 
 def _action_change_rate(
-    reference: dict[tuple[str, str, str], tuple[int, ...]],
-    candidate: dict[tuple[str, str, str], tuple[int, ...]],
+    reference: dict[tuple[str, str, str], Prediction],
+    candidate: dict[tuple[str, str, str], Prediction],
+    *,
+    semantic: bool,
 ) -> float:
     if reference.keys() != candidate.keys():
         raise ValueError("Condition variants produced different diagnostic examples")
-    return sum(reference[key] != candidate[key] for key in reference) / max(
-        1, len(reference)
-    )
+    index = 1 if semantic else 0
+    return sum(
+        reference[key][index] != candidate[key][index] for key in reference
+    ) / max(1, len(reference))
 
 
 def _overall_delta(
@@ -221,8 +236,11 @@ def _overall_delta(
 def diagnose(args: argparse.Namespace) -> dict[str, Any]:
     checkpoint_path = args.checkpoint.expanduser().resolve()
     saved = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    if saved.get("checkpoint_kind") != "plan_conditioned_executor_v1":
-        raise ValueError("Checkpoint is not a plan_conditioned_executor_v1")
+    if saved.get("checkpoint_kind") not in {
+        "plan_conditioned_executor_v1",
+        "plan_conditioned_executor_v2",
+    }:
+        raise ValueError("Checkpoint is not a supported plan-conditioned Executor")
     model_config = saved.get("model_config")
     if not isinstance(model_config, dict):
         raise TypeError("Executor checkpoint is missing model_config")
@@ -232,6 +250,17 @@ def diagnose(args: argparse.Namespace) -> dict[str, Any]:
     minimum_weight = float(
         (saved.get("executor_config") or {}).get("minimum_consensus_weight", 0.25)
     )
+    target_kind = str(
+        (saved.get("executor_config") or {}).get(
+            "target_kind", PHYSICAL_TARGET_KIND
+        )
+    )
+    # Compatibility with the descriptive V1 label written before target kinds
+    # became explicit.
+    if target_kind == "hidden_world_expected_subset_nll":
+        target_kind = PHYSICAL_TARGET_KIND
+    if target_kind not in {PHYSICAL_TARGET_KIND, SEMANTIC_TARGET_KIND}:
+        raise ValueError(f"Unsupported Executor target kind: {target_kind}")
     dataset, dataset_summary = load_executor_dataset(
         args.input,
         minimum_consensus_weight=minimum_weight,
@@ -272,13 +301,15 @@ def diagnose(args: argparse.Namespace) -> dict[str, Any]:
     variants = condition_variants(selected, seed=args.seed)
     reports: dict[str, dict[str, Any]] = {}
     predictions: dict[
-        str, dict[tuple[str, str, str], tuple[int, ...]]
+        str, dict[tuple[str, str, str], Prediction]
     ] = {}
     for name, (variant, manipulation) in variants.items():
         loader = _loader(variant, args.batch_size, args.seed)
         reports[name] = {
             "manipulation": manipulation,
-            "metrics": evaluation_report(model, loader, device),
+            "metrics": evaluation_report(
+                model, loader, device, target_kind
+            ),
         }
         predictions[name] = prediction_map(model, loader, device)
 
@@ -286,15 +317,28 @@ def diagnose(args: argparse.Namespace) -> dict[str, Any]:
     reference_predictions = predictions["correct"]
     comparison: dict[str, dict[str, Any]] = {}
     for name in ("zero_condition", "shuffled_plan", "shuffled_progress"):
+        physical_change = _action_change_rate(
+            reference_predictions,
+            predictions[name],
+            semantic=False,
+        )
+        semantic_change = _action_change_rate(
+            reference_predictions,
+            predictions[name],
+            semantic=True,
+        )
         comparison[name] = {
             "delta_from_correct": _overall_delta(
                 reference_overall,
                 reports[name]["metrics"]["overall"],
             ),
-            "action_change_rate": _action_change_rate(
-                reference_predictions,
-                predictions[name],
+            "action_change_rate": (
+                semantic_change
+                if target_kind == SEMANTIC_TARGET_KIND
+                else physical_change
             ),
+            "physical_action_change_rate": physical_change,
+            "semantic_action_change_rate": semantic_change,
         }
 
     result = {
@@ -302,6 +346,7 @@ def diagnose(args: argparse.Namespace) -> dict[str, Any]:
         "checkpoint": str(checkpoint_path),
         "input": str(args.input.expanduser().resolve()),
         "split": args.split,
+        "target_kind": target_kind,
         "split_groups": selected_groups,
         "examples": len(selected),
         "dataset_summary": dataset_summary,

@@ -14,7 +14,11 @@ import torch
 from torch import Tensor, nn
 from torch.utils.data import DataLoader
 
-from .action_space import constrained_log_partition, deterministic_subset
+from .action_space import (
+    constrained_log_partition,
+    deterministic_subset,
+    semantic_subset_log_probability,
+)
 from .executor_data import (
     EXECUTOR_CONDITION_SIZE,
     ExecutorDataset,
@@ -25,18 +29,26 @@ from .executor_data import (
 from .model import PolicyValueModel, action_space_version, build_model
 from .train_bc import TokenBucketBatchSampler, resolve_device
 
-CHECKPOINT_KIND = "plan_conditioned_executor_v1"
+PHYSICAL_TARGET_KIND = "physical_subset_v1"
+SEMANTIC_TARGET_KIND = "semantic_equivalence_v2"
+CHECKPOINT_KINDS = {
+    PHYSICAL_TARGET_KIND: "plan_conditioned_executor_v1",
+    SEMANTIC_TARGET_KIND: "plan_conditioned_executor_v2",
+}
 
 
 @dataclass(slots=True)
 class ExecutorEpochMetrics:
     epoch: int
     train_weighted_nll: float
-    train_exact_accuracy: float
+    train_target_accuracy: float
+    train_physical_accuracy: float
+    train_semantic_accuracy: float
     validation_weighted_nll: float
     validation_nll: float
-    validation_exact_accuracy: float
-    validation_empirical_action_probability: float
+    validation_target_accuracy: float
+    validation_physical_accuracy: float
+    validation_semantic_accuracy: float
 
 
 def move_executor_batch(
@@ -85,14 +97,81 @@ def expected_subset_nll(
     return torch.stack(values)
 
 
+def expected_semantic_subset_nll(
+    policy_logits: Tensor,
+    batch: dict[str, Tensor | list[dict[str, Any]]],
+) -> Tensor:
+    """Exact target NLL after summing all equivalent physical implementations."""
+    option_mask = batch["option_mask"]
+    equivalence_class_ids = batch["equivalence_class_ids"]
+    minimum = batch["minimum"]
+    maximum = batch["maximum"]
+    metadata = batch["metadata"]
+    assert isinstance(option_mask, Tensor)
+    assert isinstance(equivalence_class_ids, Tensor)
+    assert isinstance(minimum, Tensor)
+    assert isinstance(maximum, Tensor)
+    assert isinstance(metadata, list)
+    values: list[Tensor] = []
+    for row in range(policy_logits.shape[0]):
+        count = int(option_mask[row].sum())
+        logits = policy_logits[row, :count]
+        class_ids = equivalence_class_ids[row, :count]
+        expected_log_probability = logits.new_zeros(())
+        distribution = metadata[row]["semantic_action_distribution"]
+        for semantic_action, probability in distribution:
+            action_tensor = torch.tensor(
+                semantic_action,
+                dtype=torch.long,
+                device=logits.device,
+            )
+            expected_log_probability = expected_log_probability + float(
+                probability
+            ) * semantic_subset_log_probability(
+                logits,
+                class_ids,
+                action_tensor,
+                int(minimum[row]),
+                int(maximum[row]),
+            )
+        values.append(-expected_log_probability)
+    return torch.stack(values)
+
+
+def _target_nll(
+    policy_logits: Tensor,
+    batch: dict[str, Tensor | list[dict[str, Any]]],
+    target_kind: str,
+) -> Tensor:
+    if target_kind == PHYSICAL_TARGET_KIND:
+        return expected_subset_nll(policy_logits, batch)
+    if target_kind == SEMANTIC_TARGET_KIND:
+        return expected_semantic_subset_nll(policy_logits, batch)
+    raise ValueError(f"Unsupported Executor target kind: {target_kind}")
+
+
+def _target_weights(
+    batch: dict[str, Tensor | list[dict[str, Any]]],
+    target_kind: str,
+) -> Tensor:
+    name = (
+        "semantic_example_weight"
+        if target_kind == SEMANTIC_TARGET_KIND
+        else "example_weight"
+    )
+    weights = batch[name]
+    assert isinstance(weights, Tensor)
+    return weights
+
+
 def executor_loss(
     model: PolicyValueModel,
     batch: dict[str, Tensor | list[dict[str, Any]]],
+    target_kind: str = PHYSICAL_TARGET_KIND,
 ) -> tuple[Tensor, Tensor, Tensor]:
     policy_logits, _ = model(batch)  # type: ignore[arg-type]
-    nll = expected_subset_nll(policy_logits, batch)
-    weights = batch["example_weight"]
-    assert isinstance(weights, Tensor)
+    nll = _target_nll(policy_logits, batch, target_kind)
+    weights = _target_weights(batch, target_kind)
     loss = (weights * nll).sum() / weights.sum().clamp_min(1e-8)
     return loss, policy_logits, nll
 
@@ -134,6 +213,28 @@ def _batch_exact_count(
     return correct
 
 
+def _semantic_prediction(
+    prediction: list[int],
+    equivalence_class_ids: Tensor,
+) -> tuple[int, ...]:
+    return tuple(sorted(int(equivalence_class_ids[index]) for index in prediction))
+
+
+def _batch_semantic_count(
+    predictions: list[list[int]],
+    batch: dict[str, Tensor | list[dict[str, Any]]],
+) -> int:
+    class_ids = batch["equivalence_class_ids"]
+    metadata = batch["metadata"]
+    assert isinstance(class_ids, Tensor)
+    assert isinstance(metadata, list)
+    return sum(
+        _semantic_prediction(prediction, class_ids[row])
+        == tuple(metadata[row]["modal_semantic_action"])
+        for row, prediction in enumerate(predictions)
+    )
+
+
 def _empirical_action_probability(
     prediction: list[int],
     distribution: list[tuple[list[int], float]],
@@ -155,22 +256,72 @@ def _summary(records: list[dict[str, Any]]) -> dict[str, float | int]:
             "exact_accuracy": 0.0,
             "empirical_action_probability": 0.0,
             "mean_consensus_rate": 0.0,
+            "physical_exact_accuracy": 0.0,
+            "semantic_exact_accuracy": 0.0,
         }
-    total_weight = sum(record["weight"] for record in records)
+    total_weight = sum(record["target_weight"] for record in records)
+    physical_weight = sum(record["physical_weight"] for record in records)
+    semantic_weight = sum(record["semantic_weight"] for record in records)
     return {
         "examples": len(records),
         "weighted_nll": sum(
-            record["weight"] * record["nll"] for record in records
+            record["target_weight"] * record["target_nll"] for record in records
         )
         / max(total_weight, 1e-8),
-        "nll": sum(record["nll"] for record in records) / len(records),
-        "exact_accuracy": sum(record["exact"] for record in records) / len(records),
+        "nll": sum(record["target_nll"] for record in records) / len(records),
+        "exact_accuracy": sum(record["target_exact"] for record in records)
+        / len(records),
         "empirical_action_probability": sum(
-            record["empirical_action_probability"] for record in records
+            record["target_empirical_action_probability"] for record in records
         )
         / len(records),
         "mean_consensus_rate": sum(
-            record["consensus_rate"] for record in records
+            record["target_consensus_rate"] for record in records
+        )
+        / len(records),
+        "physical_weighted_nll": sum(
+            record["physical_weight"] * record["physical_nll"]
+            for record in records
+        )
+        / max(physical_weight, 1e-8),
+        "physical_nll": sum(record["physical_nll"] for record in records)
+        / len(records),
+        "physical_exact_accuracy": sum(
+            record["physical_exact"] for record in records
+        )
+        / len(records),
+        "physical_empirical_action_probability": sum(
+            record["physical_empirical_action_probability"]
+            for record in records
+        )
+        / len(records),
+        "semantic_weighted_nll": sum(
+            record["semantic_weight"] * record["semantic_nll"]
+            for record in records
+        )
+        / max(semantic_weight, 1e-8),
+        "semantic_nll": sum(record["semantic_nll"] for record in records)
+        / len(records),
+        "semantic_exact_accuracy": sum(
+            record["semantic_exact"] for record in records
+        )
+        / len(records),
+        "semantic_empirical_action_probability": sum(
+            record["semantic_empirical_action_probability"]
+            for record in records
+        )
+        / len(records),
+        "equivalence_accuracy_credit": (
+            sum(record["semantic_exact"] for record in records)
+            - sum(record["physical_exact"] for record in records)
+        )
+        / len(records),
+        "mean_physical_consensus_rate": sum(
+            record["physical_consensus_rate"] for record in records
+        )
+        / len(records),
+        "mean_semantic_consensus_rate": sum(
+            record["semantic_consensus_rate"] for record in records
         )
         / len(records),
     }
@@ -190,6 +341,7 @@ def evaluation_report(
     model: PolicyValueModel,
     loader: DataLoader,
     device: torch.device,
+    target_kind: str = PHYSICAL_TARGET_KIND,
 ) -> dict[str, Any]:
     model.eval()
     records: list[dict[str, Any]] = []
@@ -198,16 +350,24 @@ def evaluation_report(
             metadata = raw_batch["metadata"]
             assert isinstance(metadata, list)
             batch = move_executor_batch(raw_batch, device)
-            _, policy_logits, nll = executor_loss(model, batch)
+            policy_logits, _ = model(batch)  # type: ignore[arg-type]
+            physical_nll = expected_subset_nll(policy_logits, batch)
+            semantic_nll = expected_semantic_subset_nll(policy_logits, batch)
             predictions = _predicted_actions(policy_logits, batch)
             action_mask = batch["action_mask"]
             option_mask = batch["option_mask"]
-            weights = batch["example_weight"]
-            consensus = batch["consensus_rate"]
+            physical_weights = batch["example_weight"]
+            semantic_weights = batch["semantic_example_weight"]
+            physical_consensus = batch["consensus_rate"]
+            semantic_consensus = batch["semantic_consensus_rate"]
+            class_ids = batch["equivalence_class_ids"]
             assert isinstance(action_mask, Tensor)
             assert isinstance(option_mask, Tensor)
-            assert isinstance(weights, Tensor)
-            assert isinstance(consensus, Tensor)
+            assert isinstance(physical_weights, Tensor)
+            assert isinstance(semantic_weights, Tensor)
+            assert isinstance(physical_consensus, Tensor)
+            assert isinstance(semantic_consensus, Tensor)
+            assert isinstance(class_ids, Tensor)
             for row, prediction in enumerate(predictions):
                 count = int(option_mask[row].sum())
                 predicted_mask = torch.zeros(
@@ -215,22 +375,57 @@ def evaluation_report(
                 )
                 predicted_mask[prediction] = True
                 item = metadata[row]
-                distribution = item["action_distribution"]
+                physical_exact = int(
+                    torch.equal(predicted_mask, action_mask[row, :count])
+                )
+                semantic_prediction = _semantic_prediction(
+                    prediction, class_ids[row]
+                )
+                semantic_exact = int(
+                    semantic_prediction
+                    == tuple(item["modal_semantic_action"])
+                )
+                physical_probability = _empirical_action_probability(
+                    prediction, item["action_distribution"]
+                )
+                semantic_probability = _empirical_action_probability(
+                    list(semantic_prediction),
+                    item["semantic_action_distribution"],
+                )
+                if target_kind == SEMANTIC_TARGET_KIND:
+                    target_nll = semantic_nll[row]
+                    target_weight = semantic_weights[row]
+                    target_exact = semantic_exact
+                    target_probability = semantic_probability
+                    target_consensus = semantic_consensus[row]
+                else:
+                    target_nll = physical_nll[row]
+                    target_weight = physical_weights[row]
+                    target_exact = physical_exact
+                    target_probability = physical_probability
+                    target_consensus = physical_consensus[row]
                 records.append(
                     {
                         **item,
-                        "nll": float(nll[row]),
-                        "weight": float(weights[row]),
-                        "consensus_rate": float(consensus[row]),
-                        "exact": int(
-                            torch.equal(predicted_mask, action_mask[row, :count])
-                        ),
-                        "empirical_action_probability": _empirical_action_probability(
-                            prediction, distribution
-                        ),
+                        "target_nll": float(target_nll),
+                        "target_weight": float(target_weight),
+                        "target_exact": target_exact,
+                        "target_empirical_action_probability": target_probability,
+                        "target_consensus_rate": float(target_consensus),
+                        "physical_nll": float(physical_nll[row]),
+                        "physical_weight": float(physical_weights[row]),
+                        "physical_exact": physical_exact,
+                        "physical_empirical_action_probability": physical_probability,
+                        "physical_consensus_rate": float(physical_consensus[row]),
+                        "semantic_nll": float(semantic_nll[row]),
+                        "semantic_weight": float(semantic_weights[row]),
+                        "semantic_exact": semantic_exact,
+                        "semantic_empirical_action_probability": semantic_probability,
+                        "semantic_consensus_rate": float(semantic_consensus[row]),
                     }
                 )
     return {
+        "target_kind": target_kind,
         "overall": _summary(records),
         "by_plan_type": _group_report(records, "plan_type"),
         "by_phase": _group_report(records, "phase"),
@@ -394,37 +589,61 @@ def train(args: argparse.Namespace) -> tuple[PolicyValueModel, dict[str, Any]]:
         total_weighted_nll = 0.0
         total_weight = 0.0
         total_examples = 0
-        total_correct = 0
+        total_physical_correct = 0
+        total_semantic_correct = 0
         for raw_batch in train_loader:
             batch = move_executor_batch(raw_batch, device)
             optimizer.zero_grad(set_to_none=True)
-            loss, policy_logits, nll = executor_loss(model, batch)
+            loss, policy_logits, nll = executor_loss(
+                model, batch, args.target_kind
+            )
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
             optimizer.step()
             size = int(policy_logits.shape[0])
-            weights = batch["example_weight"]
-            assert isinstance(weights, Tensor)
+            weights = _target_weights(batch, args.target_kind)
             total_weighted_nll += float((weights * nll.detach()).sum())
             total_weight += float(weights.sum())
-            total_correct += _batch_exact_count(
-                _predicted_actions(policy_logits, batch), batch
+            predictions = _predicted_actions(policy_logits, batch)
+            total_physical_correct += _batch_exact_count(predictions, batch)
+            total_semantic_correct += _batch_semantic_count(
+                predictions, batch
             )
             total_examples += size
 
-        validation = evaluation_report(model, validation_loader, device)
+        validation = evaluation_report(
+            model, validation_loader, device, args.target_kind
+        )
         overall = validation["overall"]
+        train_target_correct = (
+            total_semantic_correct
+            if args.target_kind == SEMANTIC_TARGET_KIND
+            else total_physical_correct
+        )
         metrics = ExecutorEpochMetrics(
             epoch=epoch,
             train_weighted_nll=round(
                 total_weighted_nll / max(total_weight, 1e-8), 6
             ),
-            train_exact_accuracy=round(total_correct / total_examples, 6),
+            train_target_accuracy=round(
+                train_target_correct / total_examples, 6
+            ),
+            train_physical_accuracy=round(
+                total_physical_correct / total_examples, 6
+            ),
+            train_semantic_accuracy=round(
+                total_semantic_correct / total_examples, 6
+            ),
             validation_weighted_nll=round(float(overall["weighted_nll"]), 6),
             validation_nll=round(float(overall["nll"]), 6),
-            validation_exact_accuracy=round(float(overall["exact_accuracy"]), 6),
-            validation_empirical_action_probability=round(
-                float(overall["empirical_action_probability"]), 6
+            validation_target_accuracy=round(
+                float(overall["exact_accuracy"]), 6
+            ),
+            validation_physical_accuracy=round(
+                float(overall["physical_exact_accuracy"]), 6
+            ),
+            validation_semantic_accuracy=round(
+                float(overall["semantic_exact_accuracy"]), 6
             ),
         )
         history.append(metrics)
@@ -440,17 +659,28 @@ def train(args: argparse.Namespace) -> tuple[PolicyValueModel, dict[str, Any]]:
     if best_state is None:
         raise RuntimeError("Executor training did not produce a checkpoint")
     model.load_state_dict(best_state)
-    validation_report = evaluation_report(model, validation_loader, device)
-    test_report = evaluation_report(model, test_loader, device)
+    validation_report = evaluation_report(
+        model, validation_loader, device, args.target_kind
+    )
+    test_report = evaluation_report(
+        model, test_loader, device, args.target_kind
+    )
     split_summary = {
         "train": _dataset_breakdown(train_data),
         "validation": _dataset_breakdown(validation_data),
         "test": _dataset_breakdown(test_data),
     }
+    checkpoint_kind = CHECKPOINT_KINDS[args.target_kind]
+    selection_metric = (
+        "validation_semantic_weighted_nll"
+        if args.target_kind == SEMANTIC_TARGET_KIND
+        else "validation_physical_weighted_nll"
+    )
     report = {
-        "checkpoint_kind": CHECKPOINT_KIND,
+        "checkpoint_kind": checkpoint_kind,
+        "target_kind": args.target_kind,
         "selected_epoch": best_epoch,
-        "selection_metric": "validation_weighted_nll",
+        "selection_metric": selection_metric,
         "dataset": dataset_summary,
         "splits": split_summary,
         "validation": validation_report,
@@ -462,13 +692,18 @@ def train(args: argparse.Namespace) -> tuple[PolicyValueModel, dict[str, Any]]:
     output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
-            "checkpoint_kind": CHECKPOINT_KIND,
+            "checkpoint_kind": checkpoint_kind,
             "model_state_dict": best_state,
             "model_config": model_config,
             "executor_config": {
-                "executor_data_version": 1,
+                "executor_data_version": 2,
                 "condition_feature_size": EXECUTOR_CONDITION_SIZE,
-                "target_kind": "hidden_world_expected_subset_nll",
+                "target_kind": args.target_kind,
+                "semantic_equivalence": (
+                    "public_option_signature_without_physical_indices"
+                    if args.target_kind == SEMANTIC_TARGET_KIND
+                    else None
+                ),
                 "minimum_consensus_weight": args.minimum_consensus_weight,
             },
             "training_config": {
@@ -477,7 +712,7 @@ def train(args: argparse.Namespace) -> tuple[PolicyValueModel, dict[str, Any]]:
             },
             "history": [asdict(item) for item in history],
             "selected_epoch": best_epoch,
-            "selection_metric": "validation_weighted_nll",
+            "selection_metric": selection_metric,
             "dataset_summary": dataset_summary,
             "split_summary": split_summary,
             "split_manifest": split_manifest,
@@ -523,6 +758,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--initialize-from",
         type=Path,
         help="V3 action-space-v2 checkpoint used to initialize all shared tensors.",
+    )
+    parser.add_argument(
+        "--target-kind",
+        choices=(PHYSICAL_TARGET_KIND, SEMANTIC_TARGET_KIND),
+        default=SEMANTIC_TARGET_KIND,
+        help="Executor V2 defaults to semantic-equivalence probability mass.",
     )
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=256)

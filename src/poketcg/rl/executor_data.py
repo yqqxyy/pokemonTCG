@@ -18,8 +18,9 @@ from torch.utils.data import Dataset
 from .data import BCExample, collate_bc
 from .features import SEMANTIC_TAGS, EncodedDecision
 from .macro_plan import LibraryOutStrategyProfile, MacroPlanType
+from .semantic_plan import SemanticAction
 
-EXECUTOR_DATA_VERSION = 1
+EXECUTOR_DATA_VERSION = 2
 
 # Only deployable Library-Out v2 plans belong in the new executor. Legacy generic
 # macro types remain readable in macro_plan.py, but mixing both ontologies would
@@ -224,9 +225,15 @@ class ExecutorExample:
     modal_action: list[int]
     inclusion_target: list[float]
     action_distribution: list[tuple[list[int], float]]
+    equivalence_class_ids: list[int]
+    modal_semantic_action: list[int]
+    semantic_action_distribution: list[tuple[list[int], float]]
     consensus_rate: float
     normalized_entropy: float
     example_weight: float
+    semantic_consensus_rate: float
+    semantic_normalized_entropy: float
+    semantic_example_weight: float
     observation_count: int
     world_count: int
     split_group: str
@@ -322,6 +329,71 @@ def _legal_action(action: tuple[int, ...], decision: EncodedDecision) -> bool:
     )
 
 
+def semantic_equivalence_classes(decision: EncodedDecision) -> list[int]:
+    """Group options that differ only by an interchangeable physical copy.
+
+    Candidate index and in-play slot hints are deliberately removed. Publicly
+    meaningful state such as card/attack identity, owner relation, HP, energy,
+    area, effect semantics, and target status remains in the signature.
+    """
+    option_count = len(decision.options)
+    fields = (
+        ("option_card_ids", decision.option_card_ids),
+        ("option_attack_ids", decision.option_attack_ids),
+        ("option_special_conditions", decision.option_special_conditions),
+        ("option_semantics", decision.option_semantics),
+    )
+    for name, values in fields:
+        if values is None or len(values) != option_count:
+            raise ValueError(f"{name} must match the option count")
+
+    classes: dict[tuple[Any, ...], int] = {}
+    result: list[int] = []
+    for index in range(option_count):
+        # Feature positions 4 and 5 are raw index/inPlayIndex hints. All other
+        # continuous fields describe public semantic or target state.
+        public_features = tuple(
+            round(float(value), 8)
+            for feature_index, value in enumerate(decision.options[index])
+            if feature_index not in {4, 5}
+        )
+        signature = (
+            int(decision.option_types[index]),
+            int(decision.areas[index]),
+            int(decision.in_play_areas[index]),
+            int(decision.option_card_ids[index]),  # type: ignore[index]
+            int(decision.option_attack_ids[index]),  # type: ignore[index]
+            int(decision.option_special_conditions[index]),  # type: ignore[index]
+            public_features,
+            tuple(
+                round(float(value), 8)
+                for value in decision.option_semantics[index]  # type: ignore[index]
+            ),
+        )
+        class_id = classes.setdefault(signature, len(classes))
+        result.append(class_id)
+    return result
+
+
+def _validate_target_semantics(
+    row: dict[str, Any],
+    action: tuple[int, ...],
+    decision: EncodedDecision,
+) -> None:
+    raw = row.get("target_semantic_action")
+    if not isinstance(raw, dict):
+        raise ValueError("Executor V2 requires target_semantic_action")
+    semantic = SemanticAction.from_dict(raw)
+    if semantic.context != decision.context:
+        raise ValueError("Semantic target context does not match the encoded decision")
+    if len(semantic.options) != len(action):
+        raise ValueError("Semantic target cardinality does not match target_action")
+    encoded_types = Counter(decision.option_types[index] for index in action)
+    semantic_types = Counter(option.option_type for option in semantic.options)
+    if semantic_types != encoded_types:
+        raise ValueError("Semantic target option types do not match target_action")
+
+
 def _aggregate_group(
     rows: list[dict[str, Any]],
     *,
@@ -336,7 +408,9 @@ def _aggregate_group(
     progress = executor_input["progress"]
 
     votes: Counter[tuple[int, ...]] = Counter()
+    semantic_votes: Counter[tuple[int, ...]] = Counter()
     seen_worlds: dict[int, tuple[int, ...]] = {}
+    equivalence_class_ids = semantic_equivalence_classes(decision)
     for row in rows:
         if row["_public_executor_input"] != executor_input:
             raise ValueError("Executor aggregation group contains different public inputs")
@@ -345,11 +419,15 @@ def _aggregate_group(
             raise ValueError(
                 f"Invalid Executor target action {action} for state {first['state_id']}"
             )
+        _validate_target_semantics(row, action, decision)
         world = int(row["determinization_id"])
         previous = seen_worlds.setdefault(world, action)
         if previous != action:
             raise ValueError("One hidden world assigns two actions to one public input")
         votes[action] += 1
+        semantic_votes[
+            tuple(sorted(equivalence_class_ids[index] for index in action))
+        ] += 1
 
     observation_count = sum(votes.values())
     modal_action, modal_count = min(
@@ -373,6 +451,25 @@ def _aggregate_group(
     example_weight = minimum_consensus_weight + (
         1.0 - minimum_consensus_weight
     ) * (1.0 - normalized_entropy)
+    modal_semantic_action, modal_semantic_count = min(
+        semantic_votes.items(),
+        key=lambda item: (-item[1], item[0]),
+    )
+    semantic_probabilities = [
+        count / observation_count for count in semantic_votes.values()
+    ]
+    semantic_entropy = -sum(
+        probability * math.log(probability)
+        for probability in semantic_probabilities
+    )
+    semantic_normalized_entropy = semantic_entropy / math.log(max(2, legal_count))
+    semantic_normalized_entropy = min(
+        max(semantic_normalized_entropy, 0.0), 1.0
+    )
+    semantic_consensus_rate = modal_semantic_count / observation_count
+    semantic_example_weight = minimum_consensus_weight + (
+        1.0 - minimum_consensus_weight
+    ) * (1.0 - semantic_normalized_entropy)
 
     return ExecutorExample(
         decision=decision,
@@ -383,9 +480,18 @@ def _aggregate_group(
             (list(action), count / observation_count)
             for action, count in sorted(votes.items())
         ],
+        equivalence_class_ids=equivalence_class_ids,
+        modal_semantic_action=list(modal_semantic_action),
+        semantic_action_distribution=[
+            (list(action), count / observation_count)
+            for action, count in sorted(semantic_votes.items())
+        ],
         consensus_rate=consensus_rate,
         normalized_entropy=normalized_entropy,
         example_weight=example_weight,
+        semantic_consensus_rate=semantic_consensus_rate,
+        semantic_normalized_entropy=semantic_normalized_entropy,
+        semantic_example_weight=semantic_example_weight,
         observation_count=observation_count,
         world_count=len(seen_worlds),
         split_group=str(first["split_group"]),
@@ -459,6 +565,28 @@ def load_executor_dataset(
         )
         / len(examples),
         "ambiguous_inputs": sum(example.consensus_rate < 1.0 for example in examples),
+        "semantic_ambiguous_inputs": sum(
+            example.semantic_consensus_rate < 1.0 for example in examples
+        ),
+        "mean_semantic_consensus_rate": sum(
+            example.semantic_consensus_rate for example in examples
+        )
+        / len(examples),
+        "mean_semantic_normalized_entropy": sum(
+            example.semantic_normalized_entropy for example in examples
+        )
+        / len(examples),
+        "inputs_with_equivalent_options": sum(
+            len(set(example.equivalence_class_ids))
+            < len(example.equivalence_class_ids)
+            for example in examples
+        ),
+        "mean_options_per_semantic_class": sum(
+            len(example.equivalence_class_ids)
+            / max(1, len(set(example.equivalence_class_ids)))
+            for example in examples
+        )
+        / len(examples),
         "plan_types": dict(Counter(example.plan_type for example in examples)),
         "phases": dict(Counter(example.phase for example in examples)),
         "contexts": {
@@ -550,9 +678,15 @@ def collate_executor(examples: list[ExecutorExample]) -> dict[str, Tensor | list
     )
     max_options = int(batch["option_mask"].shape[1])  # type: ignore[union-attr]
     inclusion_target = torch.zeros(len(examples), max_options, dtype=torch.float32)
+    equivalence_class_ids = torch.full(
+        (len(examples), max_options), -1, dtype=torch.long
+    )
     for row, example in enumerate(examples):
         inclusion_target[row, : len(example.inclusion_target)] = torch.tensor(
             example.inclusion_target, dtype=torch.float32
+        )
+        equivalence_class_ids[row, : len(example.equivalence_class_ids)] = torch.tensor(
+            example.equivalence_class_ids, dtype=torch.long
         )
     batch.update(
         {
@@ -560,14 +694,27 @@ def collate_executor(examples: list[ExecutorExample]) -> dict[str, Tensor | list
                 [example.condition for example in examples], dtype=torch.float32
             ),
             "inclusion_target": inclusion_target,
+            "equivalence_class_ids": equivalence_class_ids,
             "example_weight": torch.tensor(
                 [example.example_weight for example in examples], dtype=torch.float32
+            ),
+            "semantic_example_weight": torch.tensor(
+                [example.semantic_example_weight for example in examples],
+                dtype=torch.float32,
             ),
             "consensus_rate": torch.tensor(
                 [example.consensus_rate for example in examples], dtype=torch.float32
             ),
             "normalized_entropy": torch.tensor(
                 [example.normalized_entropy for example in examples], dtype=torch.float32
+            ),
+            "semantic_consensus_rate": torch.tensor(
+                [example.semantic_consensus_rate for example in examples],
+                dtype=torch.float32,
+            ),
+            "semantic_normalized_entropy": torch.tensor(
+                [example.semantic_normalized_entropy for example in examples],
+                dtype=torch.float32,
             ),
             "observation_count": torch.tensor(
                 [example.observation_count for example in examples], dtype=torch.long
@@ -582,6 +729,8 @@ def collate_executor(examples: list[ExecutorExample]) -> dict[str, Tensor | list
                     "state_id": example.state_id,
                     "fingerprint": example.input_fingerprint,
                     "action_distribution": example.action_distribution,
+                    "modal_semantic_action": example.modal_semantic_action,
+                    "semantic_action_distribution": example.semantic_action_distribution,
                 }
                 for example in examples
             ],

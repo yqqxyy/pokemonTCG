@@ -6,7 +6,11 @@ from pathlib import Path
 import pytest
 import torch
 
-from poketcg.rl.action_space import subset_log_probability
+from poketcg.rl.action_space import (
+    constrained_log_partition,
+    semantic_subset_log_probability,
+    subset_log_probability,
+)
 from poketcg.rl.executor_data import (
     EXECUTOR_CONDITION_SIZE,
     EXECUTOR_PLAN_CONDITION_SLICE,
@@ -16,6 +20,7 @@ from poketcg.rl.executor_data import (
     encode_executor_condition,
     load_executor_dataset,
     sanitize_public_decision,
+    semantic_equivalence_classes,
     split_executor_dataset,
 )
 from poketcg.rl.executor_diagnostics import condition_variants
@@ -28,7 +33,10 @@ from poketcg.rl.features import (
     EncodedDecision,
     FeatureEncoderV3,
 )
-from poketcg.rl.train_executor import expected_subset_nll
+from poketcg.rl.train_executor import (
+    expected_semantic_subset_nll,
+    expected_subset_nll,
+)
 
 
 def _decision(
@@ -131,6 +139,27 @@ def _row(world: int, action: list[int], *, group: str = "game-1") -> dict:
             "progress": _progress(),
         },
         "target_action": action,
+        "target_semantic_action": {
+            "context": 3,
+            "options": [
+                {
+                    "option_type": index,
+                    "card_id": None,
+                    "attack_id": None,
+                    "player_relation": None,
+                    "area": None,
+                    "in_play_area": None,
+                    "target_card_id": None,
+                    "target_serial_hint": None,
+                    "number": None,
+                    "count": None,
+                    "special_condition": None,
+                    "index_hint": index,
+                    "in_play_index_hint": None,
+                }
+                for index in action
+            ],
+        },
     }
 
 
@@ -240,6 +269,21 @@ def test_feature_encoder_never_exposes_face_down_prize_identity() -> None:
     assert decision.option_semantics == [[0.0] * 9]
 
 
+def test_semantic_equivalence_ignores_copy_index_but_keeps_public_state() -> None:
+    decision = _decision()
+    decision.option_types = [3, 3, 3]
+    decision.option_card_ids = [58, 58, 58]
+    decision.options[0][4] = 0.0
+    decision.options[1][4] = 0.5
+    decision.options[2][4] = 0.75
+    decision.options[2][16] = 0.25
+
+    classes = semantic_equivalence_classes(decision)
+
+    assert classes[0] == classes[1]
+    assert classes[2] != classes[0]
+
+
 def test_expected_subset_nll_matches_explicit_multiselect_distribution() -> None:
     logits = torch.tensor([[0.2, -0.1, 0.4]])
     batch = {
@@ -259,6 +303,52 @@ def test_expected_subset_nll_matches_explicit_multiselect_distribution() -> None
     assert actual.item() == pytest.approx(expected.item())
 
 
+def test_semantic_loss_sums_probability_of_equivalent_physical_copies() -> None:
+    logits = torch.tensor([0.3, -0.2, 0.5])
+    classes = torch.tensor([0, 0, 1])
+    semantic_action = torch.tensor([0])
+
+    log_probability = semantic_subset_log_probability(
+        logits, classes, semantic_action, 1, 1
+    )
+    expected = torch.logsumexp(logits[:2], dim=0) - torch.logsumexp(
+        logits, dim=0
+    )
+
+    assert log_probability.item() == pytest.approx(expected.item())
+
+
+def test_semantic_loss_preserves_multiselect_class_multiplicity() -> None:
+    logits = torch.tensor([[0.2, -0.1, 0.4]])
+    batch = {
+        "option_mask": torch.tensor([[True, True, True]]),
+        "equivalence_class_ids": torch.tensor([[0, 0, 1]]),
+        "minimum": torch.tensor([2]),
+        "maximum": torch.tensor([2]),
+        "metadata": [
+            {
+                "semantic_action_distribution": [
+                    ([0, 0], 0.75),
+                    ([0, 1], 0.25),
+                ]
+            }
+        ],
+    }
+
+    actual = expected_semantic_subset_nll(logits, batch)
+    first = logits[0, 0] + logits[0, 1] - constrained_log_partition(
+        logits[0], 2, 2
+    )
+    second = (
+        torch.logsumexp(logits[0, :2], dim=0)
+        + logits[0, 2]
+        - constrained_log_partition(logits[0], 2, 2)
+    )
+    expected = -(0.75 * first + 0.25 * second)
+
+    assert actual.item() == pytest.approx(expected.item())
+
+
 def test_executor_split_never_crosses_game_groups() -> None:
     examples = []
     for index in range(9):
@@ -269,9 +359,15 @@ def test_executor_split_never_crosses_game_groups() -> None:
                 modal_action=[0],
                 inclusion_target=[1.0, 0.0, 0.0],
                 action_distribution=[([0], 1.0)],
+                equivalence_class_ids=[0, 1, 2],
+                modal_semantic_action=[0],
+                semantic_action_distribution=[([0], 1.0)],
                 consensus_rate=1.0,
                 normalized_entropy=0.0,
                 example_weight=1.0,
+                semantic_consensus_rate=1.0,
+                semantic_normalized_entropy=0.0,
+                semantic_example_weight=1.0,
                 observation_count=2,
                 world_count=2,
                 split_group=f"group-{index}",
@@ -317,9 +413,15 @@ def test_condition_ablation_changes_only_requested_segment() -> None:
                 modal_action=[0],
                 inclusion_target=[1.0, 0.0, 0.0],
                 action_distribution=[([0], 1.0)],
+                equivalence_class_ids=[0, 1, 2],
+                modal_semantic_action=[0],
+                semantic_action_distribution=[([0], 1.0)],
                 consensus_rate=1.0,
                 normalized_entropy=0.0,
                 example_weight=1.0,
+                semantic_consensus_rate=1.0,
+                semantic_normalized_entropy=0.0,
+                semantic_example_weight=1.0,
                 observation_count=2,
                 world_count=2,
                 split_group=f"group-{index}",

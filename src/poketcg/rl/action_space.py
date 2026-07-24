@@ -56,6 +56,45 @@ def constrained_log_partition(logits: Tensor, minimum: int, maximum: int) -> Ten
     return torch.logsumexp(torch.stack(rows[-1][minimum : maximum + 1]), dim=0)
 
 
+def fixed_cardinality_log_partition(logits: Tensor, count: int) -> Tensor:
+    """Log-sum-exp of all size-``count`` subsets of one equivalence class."""
+    if not 0 <= count <= logits.numel():
+        raise ValueError("Requested cardinality is inconsistent with class size")
+    return _log_prefix_partitions(logits, count)[-1][count]
+
+
+def semantic_subset_log_probability(
+    logits: Tensor,
+    equivalence_class_ids: Tensor,
+    semantic_action: Tensor,
+    minimum: int,
+    maximum: int,
+) -> Tensor:
+    """Probability mass of every physical subset implementing one semantic action."""
+    if logits.ndim != 1:
+        raise ValueError("Semantic subset logits must be one-dimensional")
+    if equivalence_class_ids.shape != logits.shape:
+        raise ValueError("equivalence_class_ids must match logits")
+    if equivalence_class_ids.dtype != torch.long:
+        raise ValueError("equivalence_class_ids must be integer class IDs")
+    if semantic_action.ndim != 1 or semantic_action.dtype != torch.long:
+        raise ValueError("semantic_action must be a one-dimensional integer tensor")
+    selected_count = semantic_action.numel()
+    if not minimum <= selected_count <= maximum:
+        raise ValueError("Semantic action violates cardinality bounds")
+
+    numerator = logits.new_zeros(())
+    for class_id in semantic_action.unique():
+        requested = int((semantic_action == class_id).sum())
+        class_logits = logits[equivalence_class_ids == class_id]
+        if class_logits.numel() < requested:
+            raise ValueError("Semantic action requests unavailable equivalent options")
+        numerator = numerator + fixed_cardinality_log_partition(
+            class_logits, requested
+        )
+    return numerator - constrained_log_partition(logits, minimum, maximum)
+
+
 def subset_log_probability(
     logits: Tensor,
     selected: Tensor,

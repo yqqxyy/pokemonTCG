@@ -1015,14 +1015,19 @@ cp /content/libraryout_macro_v2_compact_200_det8.jsonl \
 
 Executor 复用 FeatureEncoder V3 的 token/attention 主干，并把结构化 plan、卡牌/攻击目标、
 preserve 集合与 `PlanProgress` 编成一个独立 condition token。训练器不会把 8 个 hidden
-world 当成 8 个独立公开样本：它先按完整公开输入聚合动作投票。单选使用普通软标签；0/1、
-定长多选和可变多选统一使用 cardinality-constrained subset 的期望 NLL。
+world 当成 8 个独立公开样本：它先按完整公开输入聚合动作投票。
 Search determinization 内部暴露的 face-down prize 身份会在加载旧 oracle 数据时删除；新
 FeatureEncoder 也只保留奖赏卡数量，不再生成 zone-6 identity token。
 
+Executor V1 使用物理 option index 作为标签，会把“选择同名同状态的另一张卡牌副本”错误地
+算成失败。Executor V2 读取 `target_semantic_action`，删除 index/inPlayIndex hint，并保留
+card/attack、owner、area、HP、能量、目标状态和 effect semantics，将真正可互换的候选合并
+为语义等价类。loss 直接最大化一个语义动作所有合法物理实现的总概率；0/1、定长多选和可变
+多选都使用精确 cardinality-constrained semantic subset NLL。
+
 数据按 `split_group` 整局分为 train/validation/test，并近似保持 opponent 与 early/mid/late
 分布。模型只按 validation weighted NLL 选 epoch；test 在最佳 epoch 冻结后才报告。Colab
-直接读取 Drive 中已经展开的 Executor JSONL：
+从已经学到 Plan 条件的 V1 权重低学习率微调 V2：
 
 ```bash
 cd /content/pokemonTCG
@@ -1030,23 +1035,25 @@ mkdir -p /content/drive/MyDrive/pokemonTCG/checkpoints
 
 python -m poketcg.rl.train_executor \
   --input /content/drive/MyDrive/pokemonTCG/macro/libraryout_macro_v2_executor_best_200.jsonl \
-  --initialize-from /content/drive/MyDrive/pokemonTCG/checkpoints/libraryout_residual_round0.pt \
-  --output /content/drive/MyDrive/pokemonTCG/checkpoints/libraryout_executor_v1.pt \
-  --epochs 20 --batch-size 256 --learning-rate 0.0001 \
+  --initialize-from /content/drive/MyDrive/pokemonTCG/checkpoints/libraryout_executor_v1.pt \
+  --target-kind semantic_equivalence_v2 \
+  --output /content/drive/MyDrive/pokemonTCG/checkpoints/libraryout_executor_v2_semantic.pt \
+  --epochs 10 --batch-size 256 --learning-rate 0.00003 \
   --validation-fraction 0.15 --test-fraction 0.15 \
   --minimum-consensus-weight 0.25 \
-  --device cuda --seed 20260824 --split-seed 20260818
+  --device cuda --seed 20260826 --split-seed 20260818
 ```
 
-同目录会生成 `libraryout_executor_v1.report.json`。重点检查：
+同目录会生成 `libraryout_executor_v2_semantic.report.json`。重点检查：
 
 - `dataset.public_inputs` 与三个 split 的 `split_groups`，确认是公开输入聚合和整局切分；
-- `weighted_nll`，用于训练和选 epoch；
-- `exact_accuracy`，预测是否等于 hidden-world 投票的众数动作；
-- `empirical_action_probability`，预测动作在 hidden-world 教师分布中的实际概率；
+- `inputs_with_equivalent_options` 和 `mean_options_per_semantic_class`，量化旧物理指标的假错误；
+- `semantic_weighted_nll` 和 `semantic_exact_accuracy`，作为 V2 选模与主要指标；
+- `physical_exact_accuracy`，仅用于和 V1 历史报告对照；
+- `equivalence_accuracy_credit`，表示等价副本纠正了多少物理假错误；
 - `by_plan_type`、`by_phase`、`by_context`，定位只会执行某些计划或只会处理 MAIN 的退化。
 
-checkpoint 会记录 `checkpoint_kind=plan_conditioned_executor_v1`、condition schema、完整 split
+checkpoint 会记录 `checkpoint_kind=plan_conditioned_executor_v2`、condition schema、完整 split
 manifest、初始化权重覆盖情况以及 validation/test 分层报告。return、paired advantage 和
 macro synergy 不进入 Executor loss；它们属于后续冻结 Executor 后重新训练 Plan Selector 的
 阶段。
@@ -1056,11 +1063,11 @@ checkpoint 中保存的 test split manifest：
 
 ```bash
 python -m poketcg.rl.executor_diagnostics \
-  --checkpoint /content/drive/MyDrive/pokemonTCG/checkpoints/libraryout_executor_v1.pt \
+  --checkpoint /content/drive/MyDrive/pokemonTCG/checkpoints/libraryout_executor_v2_semantic.pt \
   --input /content/drive/MyDrive/pokemonTCG/macro/libraryout_macro_v2_executor_best_200.jsonl \
   --split test --batch-size 256 --device cuda \
-  --seed 20260825 \
-  --output /content/drive/MyDrive/pokemonTCG/checkpoints/libraryout_executor_v1_condition_test.json
+  --seed 20260827 \
+  --output /content/drive/MyDrive/pokemonTCG/checkpoints/libraryout_executor_v2_condition_test.json
 ```
 
 `zero_condition` 清空全部条件；`shuffled_plan` 在相同 phase/context 内换成另一种计划；
