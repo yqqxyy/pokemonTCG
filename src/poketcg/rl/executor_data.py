@@ -7,6 +7,7 @@ import json
 import math
 import random
 from collections import Counter, defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -505,44 +506,51 @@ def _aggregate_group(
 
 
 def load_executor_dataset(
-    path: str | Path,
+    path: str | Path | Sequence[str | Path],
     *,
     minimum_consensus_weight: float = 0.25,
 ) -> tuple[ExecutorDataset, dict[str, Any]]:
     """Aggregate hidden-world actions for identical deployable public inputs."""
     if not 0.0 <= minimum_consensus_weight <= 1.0:
         raise ValueError("minimum_consensus_weight must be in [0, 1]")
+    paths = [path] if isinstance(path, (str, Path)) else list(path)
+    if not paths:
+        raise ValueError("At least one Executor input file is required")
+    resolved_paths = [Path(item).expanduser() for item in paths]
     groups: dict[tuple[str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
     raw_rows = 0
-    with Path(path).expanduser().open(encoding="utf-8") as stream:
-        for line in stream:
-            if not line.strip():
-                continue
-            row = json.loads(line)
-            if row.get("schema_version") != 3:
-                raise ValueError("Executor input must use macro dataset schema 3")
-            if row.get("example_type") != "macro_executor_action":
-                raise ValueError("Input contains a non-Executor example")
-            executor_input = row.get("executor_input")
-            if not isinstance(executor_input, dict):
-                raise ValueError("Executor row is missing executor_input")
-            public_input = {
-                "decision": sanitize_public_decision(
-                    executor_input["decision"]
-                ).to_dict(),
-                "plan": executor_input["plan"],
-                "progress": executor_input["progress"],
-            }
-            row["_public_executor_input"] = public_input
-            fingerprint = _canonical_hash(public_input)
-            key = (
-                str(row["split_group"]),
-                str(row["state_id"]),
-                str(row["plan_id"]),
-                fingerprint,
-            )
-            groups[key].append(row)
-            raw_rows += 1
+    for input_path in resolved_paths:
+        with input_path.open(encoding="utf-8") as stream:
+            for line in stream:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                if row.get("schema_version") != 3:
+                    raise ValueError(
+                        "Executor input must use macro dataset schema 3"
+                    )
+                if row.get("example_type") != "macro_executor_action":
+                    raise ValueError("Input contains a non-Executor example")
+                executor_input = row.get("executor_input")
+                if not isinstance(executor_input, dict):
+                    raise ValueError("Executor row is missing executor_input")
+                public_input = {
+                    "decision": sanitize_public_decision(
+                        executor_input["decision"]
+                    ).to_dict(),
+                    "plan": executor_input["plan"],
+                    "progress": executor_input["progress"],
+                }
+                row["_public_executor_input"] = public_input
+                fingerprint = _canonical_hash(public_input)
+                key = (
+                    str(row["split_group"]),
+                    str(row["state_id"]),
+                    str(row["plan_id"]),
+                    fingerprint,
+                )
+                groups[key].append(row)
+                raw_rows += 1
     if not groups:
         raise ValueError("Executor dataset is empty")
 
@@ -553,6 +561,7 @@ def load_executor_dataset(
     summary = {
         "executor_data_version": EXECUTOR_DATA_VERSION,
         "public_sanitization": "hidden_prize_identity_v1",
+        "input_files": [str(item.resolve()) for item in resolved_paths],
         "raw_rows": raw_rows,
         "public_inputs": len(examples),
         "split_groups": len({example.split_group for example in examples}),

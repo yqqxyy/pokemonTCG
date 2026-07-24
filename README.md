@@ -1076,6 +1076,72 @@ Executor 应在 `shuffled_plan` 下出现明显正 NLL delta、负 accuracy delt
 `action_change_rate`。如果 Plan 消融明显而 Progress 消融接近零，表示它学到了计划类型，但
 还没有充分利用闭环执行状态。
 
+#### Closed-loop Plan DAgger
+
+离线 Executor 数据只包含 oracle 自己访问过的状态。部署时一旦 Student 在某一步偏离，后续
+状态就可能离开训练分布；继续照搬原 oracle 轨迹并不能给这个新状态提供正确标签。
+`--plan-dagger` 会固定根部的公开 Library-Out Plan，先执行 Plan 的 root action，此后每一步：
+
+1. Executor V2 对当前真实访问状态给出 Student 动作；
+2. continuation oracle 从该状态、当前 `PlanProgress` 和同一 Plan 重新进行 beam search；
+3. 记录 oracle 的语义等价动作标签；
+4. 以概率 `beta` 执行 oracle，否则执行 Student，再从实际到达的新状态重复搜索。
+
+因此这是 visited-state、closed-loop 的 DAgger，不是对旧 oracle 轨迹重新采样。pilot 建议先用
+较小 beam；正式采集再恢复 8×4 搜索：
+
+```bash
+python -m poketcg.rl.collect_turn_synergy \
+  --plan-dagger \
+  --expert-source artifacts/public_agents/libraryout_1208/main.py \
+  --expert-deck artifacts/public_agents/libraryout_1208/deck.csv \
+  --checkpoint artifacts/checkpoints/libraryout_residual_round0.pt \
+  --executor-checkpoint artifacts/checkpoints/libraryout_executor_v2_semantic.pt \
+  --mirror \
+  --target-states 12 --max-games 300 \
+  --determinizations 4 --plan-pool-size 4 --dagger-plan-limit 2 \
+  --dagger-beta 0.5 \
+  --beam-width 4 --branch-width 3 --max-plan-steps 32 \
+  --max-states-per-game 1 --minimum-turn 3 \
+  --workers 8 --torch-threads 1 --seed 20260828 \
+  --official-dir data/official/sample_submission/sample_submission \
+  --output /content/libraryout_plan_dagger_round1_raw.jsonl
+```
+
+summary 中首先检查 `search_failures=0`、`branch_errors={}`，再看
+`diagnostics.visited_states`、`realized_beta`、`semantic_disagreement_rate` 和
+`mean_oracle_gap`。分歧率说明 Student 在新分布上仍有多少动作需要纠正；oracle gap 衡量混合
+roll-in 与逐状态搜索上界的差距。它们是诊断量，不进入模型输入。
+
+将 raw diagnostic 转成与 Executor V2 相同的 schema 3：
+
+```bash
+python -m poketcg.rl.plan_dagger_data \
+  --input /content/libraryout_plan_dagger_round1_raw.jsonl \
+  --output /content/libraryout_plan_dagger_round1_executor.jsonl
+```
+
+重训时用 `--input` 指定本轮 visited-state 数据，并用可重复的 `--replay-input` 混入原 oracle
+数据，避免只修正偏离状态却遗忘基础执行能力。`--initialize-from` 必须指向产生本轮 roll-in 的
+同一 Executor checkpoint：
+
+```bash
+python -m poketcg.rl.train_executor \
+  --input /content/libraryout_plan_dagger_round1_executor.jsonl \
+  --replay-input /content/drive/MyDrive/pokemonTCG/macro/libraryout_macro_v2_executor_best_200.jsonl \
+  --initialize-from artifacts/checkpoints/libraryout_executor_v2_semantic.pt \
+  --target-kind semantic_equivalence_v2 \
+  --output /content/drive/MyDrive/pokemonTCG/checkpoints/libraryout_executor_v2_dagger_r1.pt \
+  --epochs 8 --batch-size 256 --learning-rate 0.00002 \
+  --validation-fraction 0.15 --test-fraction 0.15 \
+  --minimum-consensus-weight 0.25 \
+  --device cuda --seed 20260829 --split-seed 20260818
+```
+
+每轮降低 `beta`（例如 0.5 → 0.25 → 0.1），并把此前 DAgger 数据继续作为额外
+`--replay-input`。不要仅凭离线 accuracy 决定是否进入下一轮：还要用新 checkpoint 重新采集
+固定规模的 closed-loop probe，确认语义分歧率和 oracle gap 同时下降。
+
 ### Mega Lucario 显式战术规划器
 
 `TacticalPlannerAgent` 先枚举本回合可形成的攻击计划，再让后续附能、进化、换位、Boss、伤害

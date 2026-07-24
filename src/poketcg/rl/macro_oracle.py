@@ -168,6 +168,35 @@ class MacroPlanOracleEvaluator(TurnSynergyEvaluator):
         initial = self._macro_leaf(position, [step], progress, plan)
         if initial.boundary != "active":
             return [initial]
+        return self._search_continuation(
+            position,
+            plan,
+            progress,
+            prefix_steps=(step,),
+        )
+
+    def _search_continuation(
+        self,
+        position: SearchPosition,
+        plan: PlanOption,
+        progress: PlanProgress,
+        *,
+        prefix_steps: Sequence[MacroStep] = (),
+    ) -> list[MacroLeaf]:
+        """Search again from one state actually visited by an Executor.
+
+        Unlike :meth:`_search_plan`, this method does not replay the root
+        action.  That distinction is what makes it usable as a closed-loop
+        DAgger oracle after a student deviation.
+        """
+        initial = self._macro_leaf(
+            position,
+            prefix_steps,
+            progress,
+            plan,
+        )
+        if initial.boundary != "active":
+            return [initial]
         if plan.plan_type is MacroPlanType.BASELINE_V1:
             policy = self._root_policy_factory()
             current = initial
@@ -187,7 +216,8 @@ class MacroPlanOracleEvaluator(TurnSynergyEvaluator):
             return [current]
         active = [initial]
         completed: list[MacroLeaf] = []
-        for _ in range(max(0, plan.maximum_steps - 1)):
+        remaining = max(0, plan.maximum_steps - progress.decisions)
+        for _ in range(remaining):
             children: list[MacroLeaf] = []
             for leaf in active:
                 candidates = list(

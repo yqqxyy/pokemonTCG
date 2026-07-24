@@ -539,8 +539,9 @@ def _initial_model(
 def train(args: argparse.Namespace) -> tuple[PolicyValueModel, dict[str, Any]]:
     random.seed(args.seed)
     torch.manual_seed(args.seed)
+    input_paths = [args.input, *(args.replay_input or [])]
     dataset, dataset_summary = load_executor_dataset(
-        args.input,
+        input_paths,
         minimum_consensus_weight=args.minimum_consensus_weight,
     )
     train_data, validation_data, test_data, split_manifest = split_executor_dataset(
@@ -752,6 +753,16 @@ def build_parser() -> argparse.ArgumentParser:
         description="Train a V3 policy conditioned on a persistent Library-Out turn plan."
     )
     parser.add_argument("--input", type=Path, required=True)
+    parser.add_argument(
+        "--replay-input",
+        type=Path,
+        action="append",
+        default=[],
+        help=(
+            "Additional schema-3 Executor data mixed with the current DAgger "
+            "round to prevent forgetting; may be repeated."
+        ),
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--report-output", type=Path)
     parser.add_argument(

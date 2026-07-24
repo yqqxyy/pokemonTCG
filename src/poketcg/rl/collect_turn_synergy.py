@@ -33,6 +33,7 @@ from .heldout_option import HeldoutCardEffectEvaluator
 from .heldout_turn_plan import HeldoutTurnPlanEvaluator
 from .macro_oracle import MacroPlanOracleEvaluator
 from .macro_plan import MacroPlanGenerator
+from .plan_dagger import ClosedLoopPlanDAggerEvaluator, PlanExecutorPolicy
 from .residual_data import normalize_rule_scores
 from .turn_synergy import TurnSynergyEvaluator, turn_candidates
 
@@ -58,6 +59,10 @@ class SynergyCollectorConfig:
     heldout_semantic: bool = False
     heldout_option: bool = False
     macro_oracle: bool = False
+    plan_dagger: bool = False
+    executor_checkpoint: str | None = None
+    dagger_beta: float = 0.5
+    dagger_plan_limit: int = 4
     build_determinizations: int = 8
     calibration_determinizations: int = 8
     proposal_determinizations: int = 4
@@ -201,6 +206,16 @@ def _collect_shard(
         deterministic=True,
         device="cpu",
     )
+    plan_student = (
+        PlanExecutorPolicy(
+            config.executor_checkpoint,
+            card_catalog=cards,
+            attack_catalog=attacks,
+            device="cpu",
+        )
+        if config.plan_dagger and config.executor_checkpoint is not None
+        else None
+    )
     candidate_scorer = _new_external(
         config.expert_source,
         config.expert_deck,
@@ -226,6 +241,10 @@ def _collect_shard(
         "heldout_worlds": 0,
         "heldout_accepted_states": 0,
         "heldout_positive_states": 0,
+        "dagger_visited_states": 0,
+        "dagger_teacher_steps": 0,
+        "dagger_student_steps": 0,
+        "dagger_disagreements": 0,
         "selection_reasons": Counter(),
         "search_errors": Counter(),
         "branch_errors": Counter(),
@@ -360,7 +379,44 @@ def _collect_shard(
                                     "max_rollout_steps": config.max_rollout_steps,
                                     "value_policy": value_policy,
                                 }
-                                if config.macro_oracle:
+                                if config.plan_dagger:
+                                    if plan_student is None:
+                                        raise AssertionError(
+                                            "Plan DAgger student was not loaded"
+                                        )
+                                    evaluator_type = (
+                                        ClosedLoopPlanDAggerEvaluator
+                                    )
+                                    evaluator_kwargs = {
+                                        **common_kwargs,
+                                        "determinizations": (
+                                            config.determinizations
+                                        ),
+                                        "max_plan_steps": (
+                                            config.max_plan_steps
+                                        ),
+                                        "plan_generator": MacroPlanGenerator(
+                                            cards,
+                                            attacks,
+                                            maximum_steps=(
+                                                config.max_plan_steps
+                                            ),
+                                        ),
+                                        "decision_encoder": encoder.encode,
+                                        "plan_pool_size": (
+                                            config.plan_pool_size
+                                        ),
+                                        "alignment_weight": (
+                                            config.macro_alignment_weight
+                                        ),
+                                        "student_policy": plan_student,
+                                        "beta": config.dagger_beta,
+                                        "dagger_plan_limit": (
+                                            config.dagger_plan_limit
+                                        ),
+                                        "rng": rng,
+                                    }
+                                elif config.macro_oracle:
                                     evaluator_type = MacroPlanOracleEvaluator
                                     evaluator_kwargs = {
                                         **common_kwargs,
@@ -467,7 +523,37 @@ def _collect_shard(
                                         f"{type(error).__name__}: {error}"
                                     ] += 1
                                 else:
-                                    if config.heldout_option:
+                                    if config.plan_dagger:
+                                        statistics[
+                                            "effective_determinizations"
+                                        ] += int(
+                                            diagnostic[
+                                                "effective_determinizations"
+                                            ]
+                                        )
+                                        statistics[
+                                            "dagger_visited_states"
+                                        ] += int(
+                                            diagnostic["visited_states"]
+                                        )
+                                        statistics[
+                                            "dagger_teacher_steps"
+                                        ] += int(
+                                            diagnostic["teacher_steps"]
+                                        )
+                                        statistics[
+                                            "dagger_student_steps"
+                                        ] += int(
+                                            diagnostic["student_steps"]
+                                        )
+                                        statistics[
+                                            "dagger_disagreements"
+                                        ] += int(
+                                            diagnostic[
+                                                "semantic_disagreements"
+                                            ]
+                                        )
+                                    elif config.heldout_option:
                                         calibration_pairs = int(
                                             diagnostic[
                                                 "calibration_selected"
@@ -860,6 +946,65 @@ def summarize_turn_synergy(path: Path) -> dict[str, Any]:
         "warning": (
             "Full-turn plans are selected separately inside each sampled hidden "
             "world; these are oracle diagnostics, not deployable training labels."
+        ),
+    }
+
+
+def summarize_plan_dagger(path: Path) -> dict[str, Any]:
+    """Aggregate the closed-loop quantities that determine DAgger quality."""
+    roots = 0
+    worlds = 0
+    visited = 0
+    teacher_steps = 0
+    disagreements = 0
+    mixed_returns: list[float] = []
+    oracle_gaps: list[float] = []
+    plan_errors = 0
+    with path.open(encoding="utf-8") as stream:
+        for line in stream:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            diagnostic = record["diagnostic"]
+            if (
+                diagnostic.get("diagnostic_kind")
+                != "closed_loop_plan_dagger_v1"
+            ):
+                raise ValueError("Input contains a non-Plan-DAgger diagnostic")
+            roots += 1
+            worlds += int(diagnostic["effective_determinizations"])
+            visited += int(diagnostic["visited_states"])
+            teacher_steps += int(diagnostic["teacher_steps"])
+            disagreements += int(diagnostic["semantic_disagreements"])
+            for sample in diagnostic["samples"]:
+                if "error" in sample:
+                    continue
+                for plan in sample["plans"]:
+                    if "error" in plan:
+                        plan_errors += 1
+                        continue
+                    mixed_returns.append(float(plan["mixed_return"]))
+                    oracle_gaps.append(float(plan["oracle_gap"]))
+    return {
+        "roots": roots,
+        "effective_worlds": worlds,
+        "visited_states": visited,
+        "realized_beta": round(teacher_steps / max(1, visited), 6),
+        "semantic_disagreement_rate": round(
+            disagreements / max(1, visited), 6
+        ),
+        "mean_mixed_return": round(
+            statistics.mean(mixed_returns), 6
+        )
+        if mixed_returns
+        else None,
+        "mean_oracle_gap": round(statistics.mean(oracle_gaps), 6)
+        if oracle_gaps
+        else None,
+        "plan_errors": plan_errors,
+        "warning": (
+            "Returns are hidden-world search diagnostics. Training labels are "
+            "only the oracle semantic actions at states reached by roll-in."
         ),
     }
 
@@ -1268,6 +1413,28 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--heldout-option", action="store_true")
     parser.add_argument("--macro-oracle", action="store_true")
     parser.add_argument(
+        "--plan-dagger",
+        action="store_true",
+        help="Collect visited-state labels with closed-loop Plan DAgger.",
+    )
+    parser.add_argument(
+        "--executor-checkpoint",
+        type=Path,
+        help="Executor V2 student checkpoint required by --plan-dagger.",
+    )
+    parser.add_argument(
+        "--dagger-beta",
+        type=float,
+        default=0.5,
+        help="Probability of executing the oracle action during roll-in.",
+    )
+    parser.add_argument(
+        "--dagger-plan-limit",
+        type=int,
+        default=4,
+        help="Maximum non-baseline plans rolled in per hidden world.",
+    )
+    parser.add_argument(
         "--compact-macro-oracle",
         action="store_true",
         help=(
@@ -1329,6 +1496,7 @@ def main(argv: list[str] | None = None) -> int:
         "proposal-determinizations": args.proposal_determinizations,
         "heldout-determinizations": args.heldout_determinizations,
         "plan-pool-size": args.plan_pool_size,
+        "dagger-plan-limit": args.dagger_plan_limit,
         "beam-width": args.beam_width,
         "branch-width": args.branch_width,
         "max-plan-steps": args.max_plan_steps,
@@ -1345,6 +1513,8 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit(f"--{name} must be positive")
     if not 0.0 <= args.random_state_probability <= 1.0:
         raise SystemExit("--random-state-probability must be in [0, 1]")
+    if not 0.0 <= args.dagger_beta <= 1.0:
+        raise SystemExit("--dagger-beta must be in [0, 1]")
     if args.selection_risk_multiplier < 0:
         raise SystemExit("--selection-risk-multiplier must be non-negative")
     if args.option_gate_multiplier < 0:
@@ -1389,12 +1559,13 @@ def main(argv: list[str] | None = None) -> int:
             args.heldout_semantic,
             args.heldout_option,
             args.macro_oracle,
+            args.plan_dagger,
         )
     )
     if diagnostic_modes > 1:
         raise SystemExit(
-            "--heldout-semantic, --heldout-option, and --macro-oracle are "
-            "mutually exclusive"
+            "--heldout-semantic, --heldout-option, --macro-oracle, and "
+            "--plan-dagger are mutually exclusive"
         )
     if args.compact_macro_oracle and not args.macro_oracle:
         raise SystemExit("--compact-macro-oracle requires --macro-oracle")
@@ -1402,9 +1573,18 @@ def main(argv: list[str] | None = None) -> int:
     expert_source = args.expert_source.expanduser().resolve()
     expert_deck = args.expert_deck.expanduser().resolve()
     checkpoint = args.checkpoint.expanduser().resolve()
+    executor_checkpoint = (
+        args.executor_checkpoint.expanduser().resolve()
+        if args.executor_checkpoint is not None
+        else None
+    )
     engine.load_deck(expert_deck)
     if not expert_source.is_file() or not checkpoint.is_file():
         raise FileNotFoundError("expert source and checkpoint must exist")
+    if args.plan_dagger and executor_checkpoint is None:
+        raise SystemExit("--plan-dagger requires --executor-checkpoint")
+    if executor_checkpoint is not None and not executor_checkpoint.is_file():
+        raise FileNotFoundError(executor_checkpoint)
     opponents = [parse_external_opponent(value) for value in args.external_opponent]
     if args.mirror:
         opponents.append(
@@ -1439,6 +1619,14 @@ def main(argv: list[str] | None = None) -> int:
         heldout_semantic=args.heldout_semantic,
         heldout_option=args.heldout_option,
         macro_oracle=args.macro_oracle,
+        plan_dagger=args.plan_dagger,
+        executor_checkpoint=(
+            str(executor_checkpoint)
+            if executor_checkpoint is not None
+            else None
+        ),
+        dagger_beta=args.dagger_beta,
+        dagger_plan_limit=args.dagger_plan_limit,
         build_determinizations=args.build_determinizations,
         calibration_determinizations=args.calibration_determinizations,
         proposal_determinizations=args.proposal_determinizations,
@@ -1494,7 +1682,9 @@ def main(argv: list[str] | None = None) -> int:
     summary = {
         **raw,
         "diagnostic_mode": (
-            "macro_oracle"
+            "plan_dagger"
+            if args.plan_dagger
+            else "macro_oracle"
             if args.macro_oracle
             else "heldout_option"
             if args.heldout_option
@@ -1518,6 +1708,8 @@ def main(argv: list[str] | None = None) -> int:
         "proposal_determinizations": args.proposal_determinizations,
         "heldout_determinizations": args.heldout_determinizations,
         "plan_pool_size": args.plan_pool_size,
+        "dagger_beta": args.dagger_beta,
+        "dagger_plan_limit": args.dagger_plan_limit,
         "beam_width": args.beam_width,
         "branch_width": args.branch_width,
         "max_option_steps": args.max_option_steps,
@@ -1540,7 +1732,9 @@ def main(argv: list[str] | None = None) -> int:
         "elapsed_seconds": round(elapsed, 3),
         "states_per_second": round(raw["states"] / elapsed, 6),
         "diagnostics": (
-            summarize_macro_oracle(output)
+            summarize_plan_dagger(output)
+            if args.plan_dagger
+            else summarize_macro_oracle(output)
             if args.macro_oracle
             else summarize_heldout_options(output)
             if args.heldout_option

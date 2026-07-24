@@ -25,6 +25,8 @@ from poketcg.rl.macro_plan import (
     PlanProgress,
 )
 from poketcg.rl.paired_rollout import RootCandidate
+from poketcg.rl.plan_dagger import ClosedLoopPlanDAggerEvaluator
+from poketcg.rl.plan_dagger_data import prepare_plan_dagger_data
 
 
 def _observation(state: str, *, result: int = -1) -> dict:
@@ -101,6 +103,17 @@ class MacroDeterminizer:
 @dataclass
 class BaselinePolicy:
     def choose_action(self, observation: dict) -> list[int]:
+        return [0]
+
+
+@dataclass
+class DeviatingPlanStudent:
+    def choose_action(
+        self,
+        observation: dict,
+        plan: PlanOption,
+        progress: PlanProgress,
+    ) -> list[int]:
         return [0]
 
 
@@ -511,3 +524,73 @@ def test_macro_training_data_rejects_legacy_oracle(
 
     with pytest.raises(ValueError, match="accepts only"):
         prepare_macro_executor_data(source, output)
+
+
+def test_closed_loop_plan_dagger_relabels_student_visited_state(
+    tmp_path: Path,
+) -> None:
+    evaluator = ClosedLoopPlanDAggerEvaluator(
+        MacroDeterminizer(),
+        BaselinePolicy,
+        BaselinePolicy,
+        _candidates,
+        plan_generator=MacroPlanGenerator({}, {}, maximum_steps=4),
+        decision_encoder=lambda observation: {
+            "state": observation["state"]
+        },
+        student_policy=DeviatingPlanStudent(),
+        beta=0.0,
+        dagger_plan_limit=1,
+        determinizations=2,
+        plan_pool_size=2,
+        beam_width=4,
+        branch_width=2,
+        max_plan_steps=4,
+        backend=MacroBackend(),
+    )
+
+    result = evaluator.evaluate(_observation("root"))
+
+    assert result["diagnostic_kind"] == "closed_loop_plan_dagger_v1"
+    assert result["visited_states"] == 2
+    assert result["realized_beta"] == 0.0
+    assert result["semantic_disagreement_rate"] == 1.0
+    plan = result["samples"][0]["plans"][0]
+    assert plan["labels"][0]["decision"]["state"] == "setup"
+    assert plan["labels"][0]["student_action"] == [0]
+    assert plan["labels"][0]["target_action"] == [1]
+    assert plan["mixed_return"] == -1.0
+    assert plan["oracle_return"] == 1.0
+    assert plan["oracle_gap"] == 2.0
+
+    raw = tmp_path / "dagger_raw.jsonl"
+    output = tmp_path / "dagger_executor.jsonl"
+    raw.write_text(
+        json.dumps(
+            {
+                "state_id": "root-1",
+                "collector_seed": 17,
+                "game": 4,
+                "decision_index": 2,
+                "opponent": "fake",
+                "player": 0,
+                "turn": 3,
+                "selection_reason": "test",
+                "diagnostic": result,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    summary = prepare_plan_dagger_data(raw, output)
+    rows = [
+        json.loads(line)
+        for line in output.read_text(encoding="utf-8").splitlines()
+    ]
+    assert summary["executor_rows"] == 2
+    assert summary["semantic_disagreement_rate"] == 1.0
+    assert rows[0]["trajectory_selection"] == (
+        "closed_loop_dagger_visited_state"
+    )
+    assert rows[0]["executor_input"]["progress"]["decisions"] == 1
